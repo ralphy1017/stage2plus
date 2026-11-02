@@ -15,10 +15,14 @@ with Python 3.13):
 ```bash
 git clone <repository-url> stage2plus
 cd stage2plus
-python -m venv .venv
-source .venv/bin/activate
+python -m venv ../stage2plus-venv
+source ../stage2plus-venv/bin/activate
 python -m pip install numpy scipy astropy photutils pillow matplotlib
 ```
+
+Before a remote URL is configured, clone a local copy with
+`git clone --no-local /path/to/stage2plus stage2plus`. The `--no-local` option
+also works when the source and destination are on different filesystems.
 
 `stage2plus.py` is the entry point. Its three Python helper modules and the
 existing NMF basis FITS in `templates/` are included here. The input exposures
