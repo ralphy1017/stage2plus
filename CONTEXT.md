@@ -1,6 +1,6 @@
 # stage2plus: project context and validation record
 
-Updated 2026-11-02. This document explains why the current reducer has its
+Updated 2026-11-03. This document explains why the current reducer has its
 particular order and what has actually been tested. Use [README.md](README.md)
 for installation and CLI examples; use [AGENTS.md](AGENTS.md) for operational
 rules when changing or running the code.
@@ -71,6 +71,12 @@ diffuse sky mode or separation of astronomical sky from instrumental offsets.
    masks in the tested deep-field frames. The adopted default is 50: a
    256×256 box needs at least half of its pixels unmasked. This is a local
    algorithm choice validated on the pilot, not a universal sky-fit rule.
+5. **Optional unmasked 1/f fit.** Commit `c5dcd92` added
+   `--no-onef-object-mask`, which leaves grown objects unmasked in the dither
+   1/f fit only. On the 16 pilot exposures it left 6–14% more amplifier-row
+   striping than the default, so objects stay masked by default. The setting
+   is recorded as `ONEFOBJ` in SCI headers and `onef_object_mask` in
+   `summary.json`; `S2PVER` remained 2.0.
 
 ## Current v2 algorithm and recorded products
 
@@ -87,8 +93,9 @@ must be unique. A group needs at least four dithers.
    long-wave mask is projected by WCS onto short-wave exposures when present.
    Each connected object is grown by its equivalent radius, capped at 32
    pixels. Bad pixels and grown sources are excluded from the default 1/f
-   fit. On wisp detectors, the bright-wisp mask is also excluded except where
-   fewer than 64 usable pixels would remain in an amplifier row. The sky mask
+   fit; `--no-onef-object-mask` excludes only bad pixels. On wisp detectors,
+   the bright-wisp mask is also excluded except where fewer than 64 usable
+   pixels would remain in an amplifier row. The sky mask
    excludes invalid pixels, grown objects, and the NMF wisp support grown by
    eight pixels.
 2. **Dither 1/f.** All other group members are candidate peers. Up to two
@@ -118,8 +125,8 @@ split is deterministic from sorted input paths, not randomized cross
 validation. `DITHQC` records the pass/fail result; **a successful 1/f fit is
 applied even when `DITHQC=False`**. A fitting exception fails the group rather
 than silently writing an uncorrected exposure. `S2PVER`, `DITH1F`, `DITHQC`,
-`DITHN`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` in SCI headers
-help distinguish the two products.
+`DITHN`, `ONEFOBJ`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` in
+SCI headers help distinguish the two products.
 
 ## What was run and verified
 
@@ -128,7 +135,7 @@ help distinguish the two products.
 | `diagnostics/1813005_dither_stage2plus/` in the parent workspace | v1, 320 observation-005 exposures | 320 outputs; all 1/f fits applied after the 29 QC-failed targets were rerun. This predates the v2 product layout. |
 | `diagnostics/1813_dither_stage2plus/` in the parent workspace | v1, all 640 locally available 1813 exposures (observations 001 and 005), 32 workers | 640/640 sky-subtracted FITS, 16 contact sheets, zero group errors, 6:49.50 wall time; 583 held-out QC passes and 57 failures (27 in observation 001, 30 in observation 005), all 1/f models applied. All SCI headers and one SCI checksum per eight-dither group were checked. |
 | `/data5/rzi/jp/stage2plus-test-latest/` | v2.0, eight NRCBLONG F277W and eight NRCB4 F150W exposures, two leased CPUs | 16/16 each of `cal/`, `cal_sky_renorm/`, `models/`, and figures; zero errors; 13/16 held-out QC passes; 8 wisp fits; 2:29.60 wall time. Model subtraction closure and preserved ERR/DQ/ASDF data were verified on this test. |
-| `/data5/rzi/jp/stage2plus-test-nomask/` | Experimental local change to omit grown objects from the 1/f fit mask, same 16 inputs | 16/16 outputs, zero errors, 13/16 held-out QC passes, 2:32.56 wall time. This option was uncommitted and absent from pushed `main` when this document was written. The small test does not establish a preferred mask policy. |
+| `/data5/rzi/jp/stage2plus-test-nomask/` | Local change, later committed as `--no-onef-object-mask` in `c5dcd92`; same 16 inputs with grown objects left out of the 1/f fit mask | 16/16 outputs, zero errors, 13/16 held-out QC passes, 2:32.56 wall time; 6–14% more amplifier-row striping than the masked default. The default stays masked, but this small test does not settle the mask policy for other fields. |
 
 These paths are records on the development machine, **not** data shipped in
 the Git repository. The v1 input manifest is
@@ -162,11 +169,11 @@ update, the documented v2 validation is 16 exposures.
   holds a dither group; the verification run peaked near 1.4 GB RSS for the
   measured process, and memory grows with concurrent groups. There is no
   built-in resume or cross-run product compatibility check.
-- The `--no-onef-object-mask` flag and corresponding summary setting were a
-  local uncommitted change when these docs were prepared. A clean clone of
-  the pushed v2.0 baseline does not expose that option. Do not assume a run
-  with this flag is the production default or that its `S2PVER=2.0` uniquely
-  identifies the code revision; record the Git commit and working-tree state.
+- `--no-onef-object-mask` (commit `c5dcd92`) is opt-in and not the
+  production default. Check `ONEFOBJ` before comparing runs; outputs from
+  before `c5dcd92` lack that card and always masked objects. `S2PVER=2.0`
+  covers both revisions, so record the Git commit and working-tree state
+  with every run.
 
 The operational checklist and machine-specific CPU-lease convention live in
 [AGENTS.md](AGENTS.md). The README remains the user-facing run guide.

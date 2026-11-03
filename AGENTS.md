@@ -8,10 +8,11 @@ method. The upstream repository is `ralphy1017/stage2plus` on `main`.
 ## Identify the code and run before acting
 
 - Check `git status`, the current commit, and the input/output paths first.
-  The pushed v2.0 baseline is commit `bcc1514`. As of 2026-11-02 this
-  development checkout also had an **uncommitted** change in `stage2plus.py`
-  adding `--no-onef-object-mask`. Keep that user work separate from other
-  commits; a clean clone of `main` may not have the option.
+  The v2.0 restructure is commit `bcc1514`; commit `c5dcd92` added the
+  opt-in `--no-onef-object-mask` flag and the `ONEFOBJ` header card without
+  changing `S2PVER` (still 2.0). Products written before `c5dcd92` have no
+  `ONEFOBJ` card and always masked objects in the 1/f fit. Record the Git
+  commit with every run, because `S2PVER` alone does not identify the code.
 - `stage2plus.py` owns CLI validation, FITS-header grouping, long-wave then
   short-wave scheduling, product assembly, metadata, and summary writing.
   `steps.py` owns masks, WCS projection, registered-dither 1/f, masked sky,
@@ -49,14 +50,19 @@ method. The upstream repository is `ralphy1017/stage2plus` on `main`.
    frames. If no paired long-wave exposure exists, document that the
    short-wave mask used only its own segmentation. Do not mix different
    upstream calibration versions or duplicate basenames in one manifest.
-6. The default object threshold is 2.8σ with at least five connected pixels;
+6. Mask grown objects in the 1/f fit by default (`ONEFOBJ=True`).
+   `--no-onef-object-mask` masks only bad pixels and bright wisps in that fit;
+   later sky and wisp steps still use the object mask. On the 16-exposure
+   pilot it left 6–14% more amplifier-row striping, so treat it as an
+   experiment, not a production setting.
+7. The default object threshold is 2.8σ with at least five connected pixels;
    mask growth is capped at 32 pixels. Protect bright wisp regions in 1/f
    fits while retaining at least 64 usable pixels per amplifier row. The sky
    mask also excludes NMF wisp support grown by eight pixels. `Background2D`
    uses 256-pixel boxes, a 3×3 filter, biweight location, `SigmaClip()`, and
    `exclude_percentile=50`. The photutils default of 10 failed the tested
    grown-mask fields; change these settings only with a clear test.
-7. Treat missing wisp templates as an explicit review item. v2 currently
+8. Treat missing wisp templates as an explicit review item. v2 currently
    records `WISPMETH=NONE` when no basis is found; `--plan-only` counts
    template-bearing groups but does not reject all missing combinations.
    Check that this is intentional for the chosen filters and detectors.
@@ -84,8 +90,8 @@ method. The upstream repository is `ralphy1017/stage2plus` on `main`.
   and QC failures. `DITHQC=False` is a review flag, not a missing 1/f step.
   A group that fails after writing some exposures can leave partial products
   outside `summary.json`; reconcile or isolate them before retrying.
-- Verify SCI headers (`S2PVER`, `STGORDER`, `DITH1F`, `DITHQC`, `SKYSUB`,
-  `SKYMED`, `BKG2D` where applicable, `WISPMETH`, `PEDESTAL`), FITS
+- Verify SCI headers (`S2PVER`, `STGORDER`, `DITH1F`, `DITHQC`, `ONEFOBJ`,
+  `SKYSUB`, `SKYMED`, `BKG2D` where applicable, `WISPMETH`, `PEDESTAL`), FITS
   checksums, and preserved non-SCI arrays on representative outputs. Check
   arithmetic closure against `models/`: skyless SCI should match input minus
   `ONEF`, `SKYMED`, `SKYBKG`, optional `WISP`, and `PEDESTAL` to float32
