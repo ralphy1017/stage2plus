@@ -21,7 +21,10 @@ For every exposure, in this order:
    through their WCS, level-matched, and median-combined into a scene. The
    masked residual (target − scene) gives amplifier-row and detector-column
    medians, which form the 1/f model. The model is zero on average over the
-   masked sky, so the input's sky median is kept.
+   masked sky, so the input's sky median is kept. `--no-onef-object-mask`
+   fits with only bad pixels (and bright wisps) masked. On the 16 test
+   exposures this left 6–14% more amplifier-row striping, so the object mask
+   is on by default.
 4. **Masked median sky**: the median of pixels outside the grown objects, bad
    pixels and (on wisp detectors) the wisp template support.
 5. **Residual sky structure**: a JADES-style `photutils.Background2D` with
@@ -103,6 +106,7 @@ by filtering the list with `grep`.
 | `--workers N` | Dither groups processed in parallel, one CPU each (default 8). |
 | `--template-dir PATH` | NMF wisp bases (default `templates/`). |
 | `--bkg-exclude-percentile P` | `Background2D` `exclude_percentile` (default 50). |
+| `--no-onef-object-mask` | Do not mask objects in the 1/f fit (later steps still do). |
 | `--no-figures` | Skip the per-exposure step figures. |
 | `--plan-only` | Validate and estimate space without processing. |
 
@@ -123,5 +127,5 @@ one CPU, including figures.
 | `summary.json` | Settings and, per exposure: masks, 1/f fit and QC, sky, Background2D, wisp and pedestal measurements; group errors. |
 
 SCI headers record `S2PVER`, `STGORDER`, `ONEFMETH`, `DITH1F`, `DITHQC`,
-`DITHN` (dithers in the 1/f scene), `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`
-and `PEDESTAL`.
+`DITHN` (dithers in the 1/f scene), `ONEFOBJ` (objects masked for 1/f),
+`SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH` and `PEDESTAL`.

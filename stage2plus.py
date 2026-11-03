@@ -78,7 +78,7 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                                            hdul["OBJMASK"].header, exp)
         objects.append(mask)
         grown.append(steps.grow_mask(mask))
-        onef = exp.invalid | grown[-1]
+        onef = (exp.invalid | grown[-1]) if cfg["onef_object_mask"] else exp.invalid.copy()
         if basis is not None:
             onef = steps.protect_wisp(onef, basis[2])
         if onef.mean() > 0.5:
@@ -125,6 +125,7 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                  "DITH1F": (True, "dither 1/f model subtracted"),
                  "DITHQC": (onef_meta["qc_accepted"], "held-out dither 1/f check passed"),
                  "DITHN": (len(onef_meta["scene_dithers"]), "dithers in 1/f scene"),
+                 "ONEFOBJ": (cfg["onef_object_mask"], "objects masked in the 1/f fit"),
                  "SKYMED": (sky_median, "masked median sky (MJy/sr)"),
                  "WISPMETH": ("NMF" if wisp is not None else "NONE", "wisp model"),
                  "PEDESTAL": (pedestal, "post-wisp masked median removed (MJy/sr)")}
@@ -227,6 +228,8 @@ def main() -> int:
     parser.add_argument("--bkg-exclude-percentile", type=float, default=50.0,
                         help="Background2D exclude_percentile: skip boxes with more than "
                              "this percent masked (default 50; photutils default 10)")
+    parser.add_argument("--no-onef-object-mask", action="store_true",
+                        help="fit 1/f masking only bad pixels (and bright wisps), not objects")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
@@ -287,7 +290,8 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     cfg = {"output_dir": str(output_dir), "template_dir": str(args.template_dir.resolve()),
            "figures": not args.no_figures,
-           "bkg_exclude_percentile": args.bkg_exclude_percentile, "lw_models": lw_models}
+           "bkg_exclude_percentile": args.bkg_exclude_percentile, "lw_models": lw_models,
+           "onef_object_mask": not args.no_onef_object_mask}
     print(f"Starting {len(paths)} exposures in {len(groups)} dither groups "
           f"({len(long_groups)} LW, {len(short_groups)} SW); up to {args.workers} workers",
           flush=True)
@@ -301,6 +305,7 @@ def main() -> int:
                "method": "photutils object mask -> registered-dither 1/f -> masked median "
                          "sky -> Background2D -> NMF wisp -> pedestal; cal/ omits both sky steps",
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
+                            "onef_object_mask": cfg["onef_object_mask"],
                             "segment_nsigma": steps.SEGMENT_NSIGMA,
                             "mask_growth_cap": steps.MASK_GROWTH_CAP,
                             "wisp_support_growth": steps.WISP_SUPPORT_GROWTH,
