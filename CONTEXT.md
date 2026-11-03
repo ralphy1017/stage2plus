@@ -1,6 +1,6 @@
 # stage2plus: project context and validation record
 
-Updated 2026-11-02. This document explains why the current reducer has its
+Updated 2026-11-03. This document explains why the current reducer has its
 particular order and what has actually been tested. Use [README.md](README.md)
 for installation and CLI examples; use [AGENTS.md](AGENTS.md) for operational
 rules when changing or running the code.
@@ -19,7 +19,7 @@ The v2 pipeline has two outputs for each input:
 
 | Output | SCI content | Intended use |
 | --- | --- | --- |
-| `cal/` | input − dither 1/f − NMF wisp − final scalar pedestal | Exposure with the measured sky retained for sky analysis. |
+| `cal/` | input − selected 1/f − NMF wisp − final scalar pedestal | Exposure with the measured sky retained for sky analysis. |
 | `cal_sky_renorm/` | `cal/` − object-masked median sky − `Background2D` residual sky | Sky-subtracted drizzle input. |
 
 The same 1/f, wisp, and scalar pedestal models are used in both products. The
@@ -71,6 +71,15 @@ diffuse sky mode or separation of astronomical sky from instrumental offsets.
    masks in the tested deep-field frames. The adopted default is 50: a
    256×256 box needs at least half of its pixels unmasked. This is a local
    algorithm choice validated on the pilot, not a universal sky-fit rule.
+5. **v2.1 1/f fallback (current local change).** The dither candidate is
+   selected only when held-out QC passes. If a group has fewer than four
+   exposures, the dither fit raises, or held-out QC fails, the code discards
+   that candidate and applies one Jumprope-style single-frame scan model.
+   `cal/` and `cal_sky_renorm/` share this one selected model. Groups may now
+   contain one or more exposures. Fallback products are marked `SELF` and
+   `ONEFSTAT=REVIEW` because the scan fit has no independent held-out peer
+   test. This change has not yet had its own science pilot; the 16-exposure
+   v2.0 verification results below do not validate the fallback.
 
 ## Current v2 algorithm and recorded products
 
@@ -79,7 +88,8 @@ identifies unusable pixels from DO_NOT_USE DQ (grown one pixel), nonfinite or
 zero science, and invalid ERR. Header fields `PROGRAM`, `OBSERVTN`, `VISIT`,
 `VISITGRP`, `SEQ_ID`, `ACT_ID`, `DETECTOR`, `FILTER`, and `PUPIL` define each
 group; filenames are not used to decide dither membership. Input basenames
-must be unique. A group needs at least four dithers.
+must be unique. A group needs at least one exposure; dither fitting requires
+at least four group exposures so it has two scene peers and a held-out peer.
 
 1. **Object and fit masks.** Photutils detects sources with at least five
    connected pixels at 2.8 times an ERR-based threshold over the image
@@ -91,21 +101,34 @@ must be unique. A group needs at least four dithers.
    fewer than 64 usable pixels would remain in an amplifier row. The sky mask
    excludes invalid pixels, grown objects, and the NMF wisp support grown by
    eight pixels.
-2. **Dither 1/f.** All other group members are candidate peers. Up to two
+2. **Dither 1/f and backup selection.** For groups with at least four
+   exposures, all other group members are candidate peers. Up to two
    peers are held out for QC, leaving at least two for a WCS-shifted,
    scalar-level-matched median scene. The shifts are accepted only when
    sampled WCS offsets vary by at most 0.1 pixel across the detector. A
    robustly clipped residual (`target − scene`) yields a row profile for each
    of the four amplifiers and a detector-column profile. The model is
-   anchored to preserve the target's masked global sky median. `ONEF` in
-   `models/` is the full-resolution model actually subtracted.
-3. **Sky and wisps.** The masked median is subtracted first. A
+   anchored to preserve the target's masked global sky median. Select it only
+   when held-out QC passes. A small group, fitting error, or failed QC
+   selects the single-frame fallback; the rejected dither model is discarded
+   and never added to the fallback.
+3. **Single-frame backup.** The fallback ports Jumprope's
+   `profoundSkyScan(..., keep_trend=True)` behavior: transpose the image into
+   detector scan orientation, mask DQ/invalid pixels and the same object and
+   bright-wisp fit mask, clip values above the unmasked 90th percentile,
+   measure 40th-percentile row/column profiles, scan in 512-row blocks, and
+   keep the centered profiles after subtracting a 501-pixel running-median
+   trend. This matches the `one_over_f(..., keep_trend=True)` behavior in the
+   parent `stage2-plus.py`; it is implemented locally in `steps.py` with no
+   additional dependency. It produces one `ONEF` map and is subtracted once.
+   Fallback has no independent held-out QC and is marked `ONEFSTAT=REVIEW`.
+4. **Sky and wisps.** The masked median is subtracted first. A
    `Background2D` residual model uses 256-pixel boxes, a 3×3 filter,
    `BiweightLocationBackground`, `SigmaClip()`, and 50% box exclusion by
    default. On detector/filter combinations with a bundled basis, the fixed
    NMF components are fitted by ERR-weighted nonnegative least squares after
    measuring an off-wisp baseline. The last masked median is the pedestal.
-4. **Outputs.** `models/<basename>.fits` contains `OBJMASK`, `SKYMASK`,
+5. **Outputs.** `models/<basename>.fits` contains `OBJMASK`, `SKYMASK`,
    `ONEF`, `SKYBKG`, and `WISP` when fitted; its primary header stores
    `SKYMED` and `PEDESTAL`. `figures/<stem>_steps.png` shows input, masks,
    models, intermediate frames, and both final products. `summary.json`
@@ -115,11 +138,14 @@ must be unique. A group needs at least four dithers.
 The held-out QC requires mean amplifier-row and 64-pixel tile RMS to improve
 by more than 5%, with no held-out peer worsening by more than 5%. The peer
 split is deterministic from sorted input paths, not randomized cross
-validation. `DITHQC` records the pass/fail result; **a successful 1/f fit is
-applied even when `DITHQC=False`**. A fitting exception fails the group rather
-than silently writing an uncorrected exposure. `S2PVER`, `DITH1F`, `DITHQC`,
-`DITHN`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` in SCI headers
-help distinguish the two products.
+validation. `DITHQC` records the dither-only result. On a dither QC failure,
+the dither candidate is discarded; `ONEFMETH=SELF`, `DITH1F=False`, and
+`ONEFSTAT=REVIEW` identify the selected backup. If dither QC was unavailable
+because the fit failed or the group was small, it is null in JSON and omitted
+from the SCI header. `ONEFAPPL` records that the selected model was subtracted.
+`S2PVER`, `ONEFMETH`, `ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `DITH1F`, `DITHQC`,
+`DITHN`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` distinguish
+method and product provenance.
 
 ## What was run and verified
 
@@ -135,8 +161,9 @@ the Git repository. The v1 input manifest is
 `../diagnostics/1813_dither_stage2plus/inputs.txt`, pointing to the calibrated
 source directory
 `/data2/rzi/skysurfir/w200-v1-stage2-pid01813-test-v1/nircam/stage2/cal/`.
-The v1 640-exposure result is not a v2 full-database deployment. As of this
-update, the documented v2 validation is 16 exposures.
+The v1 640-exposure result is not a v2 full-database deployment. The v2.0
+validation remains 16 exposures. The v2.1 fallback change has not been run on
+a science pilot; it must not be treated as production validated.
 
 ## Practical limits and open scientific checks
 

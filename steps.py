@@ -28,6 +28,9 @@ SEGMENT_NSIGMA = 2.8
 MASK_GROWTH_CAP = 32       # pixels
 WISP_SUPPORT_GROWTH = 8    # pixels excluded around the wisp template support
 MAX_HELDOUT = 2            # dithers withheld from each 1/f scene for QC
+MIN_DITHER_SCENE_PEERS = 2
+SCAN_BLOCK_ROWS = 512
+SCAN_TREND_BLOCK = 501
 
 # JADES per-exposure background: photutils.Background2D with these settings.
 BKG_BOX = (256, 256)
@@ -228,8 +231,11 @@ def dither_onef(target: Exposure, peers: list[Exposure],
     Up to MAX_HELDOUT peers (keeping at least two in the scene) are withheld.
     QC passes when their mean amplifier-row and 64-pixel tile RMS against the
     target both improve by more than 5% and no withheld peer worsens by more
-    than 5%. The model is applied either way; QC is recorded.
+    than 5%. A QC failure returns its candidate and diagnostics; the caller
+    must select the single-frame fallback instead of applying that candidate.
     """
+    if len(peers) < MIN_DITHER_SCENE_PEERS + 1:
+        raise ValueError("Dither 1/f requires at least two scene peers and one held-out peer")
     n_fit = max(2, len(peers) - MAX_HELDOUT)
     fit_peers, heldout = peers[:n_fit], peers[n_fit:]
     try:
@@ -259,6 +265,95 @@ def dither_onef(target: Exposure, peers: list[Exposure],
                     c["tile_after"] < 1.05 * c["tile_before"] for c in checks))
     return model, {"scene_dithers": [p.path.name for p in fit_peers], **meta,
                    "qc_accepted": bool(accepted), **mean, "heldout": checks}
+
+
+def _scan_1f_xy(image: np.ndarray, invalid: np.ndarray,
+                block_rows: int = SCAN_BLOCK_ROWS,
+                trend_block: int = SCAN_TREND_BLOCK,
+                clip_hi: float = 0.90,
+                sky_quantile: float = 0.40) -> tuple[np.ndarray, dict]:
+    """Vectorized ProFound-style scan model in detector XY orientation.
+
+    Estimate column profiles in row blocks and row profiles across the full
+    width. Keep their centered 40th-percentile structure after removing a
+    501-pixel running-median trend, matching the Jumprope keep_trend=True
+    configuration. The upper 10% of unmasked values are excluded from the
+    estimates. Masked science pixels are not changed by this model.
+    """
+    original = np.asarray(image, dtype=np.float32)
+    bad = np.asarray(invalid, dtype=bool) | ~np.isfinite(original) | (original == 0)
+    good = ~bad
+    if good.sum() < 1000:
+        raise ValueError("Too few usable pixels for single-frame 1/f scan")
+    clip_value = float(np.quantile(original[good], clip_hi))
+    # Input SCI is float32; retain that precision and halve the full-frame
+    # working copy compared with float64.
+    scan = original.copy()
+    scan[bad | (scan > clip_value)] = np.nan
+    ny, nx = scan.shape
+
+    row_slices = []
+    row_profiles = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for y0 in range(0, ny, block_rows):
+            y1 = min(ny, y0 + block_rows)
+            row_slices.append((y0, y1))
+            row_profiles.append(np.nanquantile(scan[y0:y1], sky_quantile, axis=0))
+        row_profiles = np.asarray(row_profiles, dtype=np.float64)
+        if not np.isfinite(row_profiles).any():
+            raise ValueError("No valid row profiles for single-frame 1/f scan")
+        row_center = float(np.nanmedian(row_profiles))
+
+    row_map = np.zeros((ny, nx), dtype=np.float32)
+    wx = min(trend_block, nx)
+    if wx % 2 == 0:
+        wx -= 1
+    for ib, (y0, y1) in enumerate(row_slices):
+        values = row_profiles[ib] - row_center
+        finite = np.isfinite(values)
+        if finite.any():
+            filled = np.interp(np.arange(nx), np.flatnonzero(finite), values[finite])
+            trend = ndi.median_filter(filled, size=wx, mode="nearest") if wx > 1 else 0.0
+            row_map[y0:y1] = np.where(finite, values - trend, 0.0)[None, :]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        column_profile = np.nanquantile(scan, sky_quantile, axis=1)
+        if not np.isfinite(column_profile).any():
+            raise ValueError("No valid column profile for single-frame 1/f scan")
+        column_center = float(np.nanmedian(column_profile))
+    centered = column_profile - column_center
+    finite_column = np.isfinite(centered)
+    wy = min(trend_block, ny)
+    if wy % 2 == 0:
+        wy -= 1
+    if finite_column.any():
+        filled_column = np.interp(np.arange(ny), np.flatnonzero(finite_column),
+                                  centered[finite_column])
+        trend_column = (ndi.median_filter(filled_column, size=wy, mode="nearest")
+                        if wy > 1 else 0.0)
+        column_map = np.where(finite_column, centered - trend_column, 0.0).astype(np.float32)
+    else:
+        column_map = np.zeros(ny, dtype=np.float32)
+
+    model = row_map + column_map[:, None]
+    model[bad] = 0.0
+    stats = {"algorithm": "PROFOUND_SCAN_KEEP_TREND",
+             "clip_hi": clip_hi, "clip_value": clip_value,
+             "sky_quantile": sky_quantile, "block_rows": block_rows,
+             "trend_block": trend_block, "keep_trend": True,
+             "row_profile_coverage": float(np.isfinite(row_profiles).mean()),
+             "column_profile_coverage": float(finite_column.mean()),
+             "fit_fraction": float(np.isfinite(scan).mean()),
+             "model_rms": float(np.sqrt(np.mean(model[good].astype(np.float64) ** 2)))}
+    return model, stats
+
+
+def scan_onef(image: np.ndarray, invalid: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Single-frame backup using Jumprope's keep_trend=True scan orientation."""
+    model_xy, meta = _scan_1f_xy(np.asarray(image).T, np.asarray(invalid).T)
+    return np.asarray(model_xy.T, dtype=np.float32), meta
 
 
 # Sky, wisp and pedestal -----------------------------------------------------
@@ -354,6 +449,9 @@ def write_fits(exp: Exposure, path: Path, science: np.ndarray, cards: dict,
             seen.add(hdu.name.upper())
             if hdu.name.upper() == "SCI":
                 header = hdu.header.copy()
+                for key in ("DITHQC", "DITHN"):
+                    if key in header:
+                        del header[key]
                 for key, value in cards.items():
                     header[key] = value
                 header.add_history(history)

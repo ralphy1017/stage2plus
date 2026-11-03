@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Stage 2 plus: clean JWST NIRCam dither groups before drizzling.
 
-For each exposure in a dither group (same visit, detector, filter and pupil,
-at least four dithers) it writes two products from the input science:
+For each exposure in a dither group (same visit, detector, filter and pupil)
+it writes two products from the input science. Registered dither fitting is
+used with at least four dithers; failed or QC-rejected fits use a masked
+Jumprope-style single-frame scan fallback:
 
   cal_sky_renorm/  photutils object mask -> registered-dither 1/f -> masked
                    median sky -> Background2D residual sky -> NMF wisp (where
@@ -41,8 +43,9 @@ from scipy import ndimage as ndi
 import steps
 from figures import plot_steps
 
-VERSION = "2.0"
-MIN_DITHERS = 4
+VERSION = "2.1"
+MIN_DITHERS = 1
+DITHER_MIN_DITHERS = 4
 DETECTOR_PATTERN = re.compile(r"^NRC[AB](?:[1-4]|LONG)$")
 VISIT_KEYS = ("PROGRAM", "OBSERVTN", "VISIT", "VISITGRP", "SEQ_ID", "ACT_ID")
 
@@ -58,6 +61,45 @@ def group_label(info: dict) -> str:
     program, obs, visit, visitgrp, seq, act = info["visit"]
     return "_".join((f"jw{program}{obs}{visit}", f"{visitgrp}{seq}{act}", info["detector"],
                      info["filter"], info["pupil"])).lower()
+
+
+def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray
+             ) -> tuple[np.ndarray, dict]:
+    """Select one 1/f model: validated dither first, scan fallback otherwise."""
+    dither_meta = None
+    dither_error = None
+    dither_model = None
+    try:
+        dither_model, dither_meta = steps.dither_onef(exp, peers, good)
+        if dither_meta["qc_accepted"]:
+            return dither_model, {**dither_meta, "method": "DITHER",
+                                  "status": "PASS", "applied": True,
+                                  "dither_attempted": True,
+                                  "fallback_attempted": False,
+                                  "fallback_reason": None}
+        dither_error = "held-out dither 1/f QC failed"
+    except Exception as exc:
+        dither_error = f"{type(exc).__name__}: {exc}"
+
+    # Do not keep the rejected full-frame candidate alive while allocating the
+    # scan fallback; large groups can otherwise have a high peak RSS here.
+    del dither_model
+    try:
+        model, fallback_meta = steps.scan_onef(exp.science, ~good)
+    except Exception as exc:
+        raise ValueError(f"Dither 1/f failed ({dither_error}); single-frame "
+                         f"fallback failed ({type(exc).__name__}: {exc})") from exc
+    return model, {"method": "SELF", "status": "REVIEW", "applied": True,
+                   "qc_accepted": (dither_meta["qc_accepted"]
+                                   if dither_meta is not None else None),
+                   "dither_attempted": True,
+                   "dither": dither_meta,
+                   "dither_error": dither_error,
+                   "fallback_attempted": True,
+                   "fallback_reason": dither_error,
+                   "fallback": fallback_meta,
+                   "model_rms": fallback_meta["model_rms"],
+                   "fit_fraction": fallback_meta["fit_fraction"]}
 
 
 def process_group(label: str, paths: list[str], cfg: dict) -> dict:
@@ -89,9 +131,9 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
     support = (ndi.binary_dilation(basis[1], iterations=steps.WISP_SUPPORT_GROWTH)
                if basis is not None else None)
     for i, exp in enumerate(exposures):
-        # 2. Registered-dither 1/f from the group's other exposures.
-        onef, onef_meta = steps.dither_onef(exp, exposures[:i] + exposures[i + 1:],
-                                            ~onef_masks[i])
+        # 2. Registered-dither 1/f, with one masked scan fallback if needed.
+        onef, onef_meta = fit_onef(exp, exposures[:i] + exposures[i + 1:],
+                                   ~onef_masks[i])
         after_onef = exp.science - onef
         sky_mask = exp.invalid | grown[i] | ~np.isfinite(after_onef)
         if support is not None:
@@ -121,14 +163,23 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
 
         name = exp.path.name
         cards = {"S2PVER": (VERSION, "stage2plus version"),
-                 "ONEFMETH": ("DITHER", "registered-dither 1/f"),
-                 "DITH1F": (True, "dither 1/f model subtracted"),
-                 "DITHQC": (onef_meta["qc_accepted"], "held-out dither 1/f check passed"),
-                 "DITHN": (len(onef_meta["scene_dithers"]), "dithers in 1/f scene"),
+                 "ONEFMETH": (onef_meta["method"], "selected 1/f method"),
+                 "ONEFSTAT": (onef_meta["status"], "selected method QC status"),
+                 "ONEFAPPL": (onef_meta["applied"], "1/f model subtracted"),
+                 "ONEFVER": ("DITH-V2" if onef_meta["method"] == "DITHER"
+                             else "SCAN-KT1", "selected 1/f implementation"),
+                 "DITH1F": (onef_meta["method"] == "DITHER",
+                            "registered-dither model selected"),
                  "ONEFOBJ": (cfg["onef_object_mask"], "objects masked in the 1/f fit"),
                  "SKYMED": (sky_median, "masked median sky (MJy/sr)"),
                  "WISPMETH": ("NMF" if wisp is not None else "NONE", "wisp model"),
                  "PEDESTAL": (pedestal, "post-wisp masked median removed (MJy/sr)")}
+        if onef_meta["qc_accepted"] is not None:
+            cards["DITHQC"] = (onef_meta["qc_accepted"],
+                               "held-out dither 1/f check passed")
+        if onef_meta["method"] == "DITHER":
+            cards["DITHN"] = (len(onef_meta["scene_dithers"]),
+                              "dithers in selected 1/f scene")
         steps.write_fits(exp, out / "cal_sky_renorm" / name, final_sky,
                          cards={**cards, "STGORDER": ("MASK-1F-SKY-BKG2D-WISP-PED", "steps"),
                                 "SKYSUB": (True, "median sky and Background2D removed"),
@@ -139,17 +190,17 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                                 "SKYSUB": (False, "sky retained")},
                          history="SCI = input - 1/f - wisp - pedestal (sky retained)")
         write_models(exp, out / "models" / name, objects[i], sky_mask, onef,
-                     background, wisp, sky_median, pedestal)
+                     background, wisp, sky_median, pedestal, onef_meta)
 
         noise = steps.robust_sigma(final_sky[sky_good][::40])
         if cfg["figures"]:
             plot_steps(out / "figures" / (Path(name).stem + "_steps.png"),
-                       f"{name} | {detector} {band} | 1/f held-out QC "
-                       f"{'passed' if onef_meta['qc_accepted'] else 'failed'}",
+                       f"{name} | {detector} {band} | 1/f {onef_meta['method']} "
+                       f"({onef_meta['status']})",
                        [("Input SCI", exp.science, "sky"),
                         ("Object mask (black), sky mask (grey)",
                          sky_mask.astype(np.uint8) + objects[i], "mask"),
-                        ("Dither 1/f model", onef, "model"),
+                        (f"{onef_meta['method']} 1/f model", onef, "model"),
                         ("After 1/f", after_onef, "sky"),
                         (f"After median sky ({sky_median:.4f})", skyless, "skyless"),
                         ("Background2D model", background, "model"),
@@ -173,10 +224,19 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
 
 
 def write_models(exp, path: Path, objects, sky_mask, onef, background, wisp,
-                 sky_median: float, pedestal: float) -> None:
+                 sky_median: float, pedestal: float, onef_meta: dict) -> None:
     primary = fits.PrimaryHDU()
     primary.header["SKYMED"] = (sky_median, "masked median sky (MJy/sr)")
     primary.header["PEDESTAL"] = (pedestal, "post-wisp masked median (MJy/sr)")
+    primary.header["ONEFMETH"] = (onef_meta["method"], "selected 1/f method")
+    primary.header["ONEFSTAT"] = (onef_meta["status"], "selected method QC status")
+    primary.header["ONEFAPPL"] = (onef_meta["applied"], "1/f model subtracted")
+    primary.header["ONEFVER"] = ("DITH-V2" if onef_meta["method"] == "DITHER"
+                                  else "SCAN-KT1", "selected 1/f implementation")
+    primary.header["DITH1F"] = (onef_meta["method"] == "DITHER",
+                                "registered-dither model selected")
+    if onef_meta["qc_accepted"] is not None:
+        primary.header["DITHQC"] = (onef_meta["qc_accepted"], "dither QC passed")
     hdus = [primary,
             fits.ImageHDU(objects.astype(np.uint8), exp.sci_header, name="OBJMASK"),
             fits.ImageHDU(sky_mask.astype(np.uint8), exp.sci_header, name="SKYMASK"),
@@ -209,9 +269,13 @@ def run_groups(groups: dict[str, list[str]], cfg: dict, workers: int, phase: str
                 print(f"{phase} FAILED {label}: {exc}", file=sys.stderr, flush=True)
                 continue
             results.append(result)
-            passed = sum(r["onef"]["qc_accepted"] for r in result["records"])
-            print(f"{phase} {len(results)}/{len(groups)} {label}: 1/f QC passed "
-                  f"{passed}/{len(result['records'])}", flush=True)
+            qc_passed = sum(r["onef"]["qc_accepted"] is True
+                            for r in result["records"])
+            fallbacks = sum(r["onef"]["method"] == "SELF"
+                            for r in result["records"])
+            print(f"{phase} {len(results)}/{len(groups)} {label}: dither QC "
+                  f"passed {qc_passed}/{len(result['records'])}; "
+                  f"scan fallbacks {fallbacks}", flush=True)
     return results, errors
 
 
@@ -280,6 +344,10 @@ def main() -> int:
                           "longwave_groups": len(long_groups),
                           "shortwave_groups": len(short_groups),
                           "dithers_per_group": dict(Counter(len(v) for v in groups.values())),
+                          "dither_eligible_groups": sum(len(v) >= DITHER_MIN_DITHERS
+                                                        for v in groups.values()),
+                          "scan_fallback_groups": sum(len(v) < DITHER_MIN_DITHERS
+                                                       for v in groups.values()),
                           "wisp_template_groups": len(with_wisp),
                           "shortwave_with_longwave_mask": len(lw_models),
                           "workers": args.workers,
@@ -302,9 +370,13 @@ def main() -> int:
     records = sorted((r for result in results for r in result["records"]),
                      key=lambda r: r["file"])
     summary = {"stage2plus": VERSION,
-               "method": "photutils object mask -> registered-dither 1/f -> masked median "
+               "method": "photutils object mask -> dither 1/f or Jumprope-style scan fallback "
+                         "-> masked median "
                          "sky -> Background2D -> NMF wisp -> pedestal; cal/ omits both sky steps",
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
+                            "dither_min_dithers": DITHER_MIN_DITHERS,
+                            "onef_mode": "AUTO",
+                            "fallback_method": "PROFOUND_SCAN_KEEP_TREND",
                             "onef_object_mask": cfg["onef_object_mask"],
                             "segment_nsigma": steps.SEGMENT_NSIGMA,
                             "mask_growth_cap": steps.MASK_GROWTH_CAP,
@@ -312,8 +384,14 @@ def main() -> int:
                             "max_heldout": steps.MAX_HELDOUT,
                             "template_dir": cfg["template_dir"]},
                "selected": len(paths), "completed": len(records),
-               "onef_qc_passed": sum(r["onef"]["qc_accepted"] for r in records),
-               "onef_qc_failed": sum(not r["onef"]["qc_accepted"] for r in records),
+               "onef_applied": sum(r["onef"]["applied"] for r in records),
+               "onef_dither_selected": sum(r["onef"]["method"] == "DITHER"
+                                           for r in records),
+               "onef_fallback_selected": sum(r["onef"]["method"] == "SELF"
+                                             for r in records),
+               "onef_qc_passed": sum(r["onef"]["qc_accepted"] is True for r in records),
+               "onef_qc_failed": sum(r["onef"]["qc_accepted"] is False for r in records),
+               "onef_qc_unavailable": sum(r["onef"]["qc_accepted"] is None for r in records),
                "results": records, "errors": errors}
     temp = output_dir / "summary.json.writing"
     temp.write_text(json.dumps(summary, indent=2, default=str) + "\n")
