@@ -2,10 +2,10 @@
 """Stage 2 plus: clean JWST NIRCam dither groups before drizzling.
 
 For each exposure in a dither group (same visit, detector, filter and pupil)
-it writes two products from the input science. The default 1/f model uses all
-overlapping peers, full-WCS registration, background matching, a sigma-clipped
-median scene, and sigma-clipped per-amplifier row offsets. The single-frame
-scan is used only when a dither model cannot be computed:
+it writes two products from the input science. By default it uses the
+single-frame keep-trend scan correction. The optional auto mode first tries a
+registered-dither model using all overlapping peers, then uses the scan only
+when that fit cannot be computed:
 
   cal_sky_renorm/  photutils object mask -> registered-dither 1/f -> masked
                    median sky -> Background2D residual sky -> NMF wisp (where
@@ -44,7 +44,7 @@ from scipy import ndimage as ndi
 import steps
 from figures import plot_steps
 
-VERSION = "2.5"
+VERSION = "2.6"
 MIN_DITHERS = 1
 DITHER_MIN_DITHERS = 2
 DETECTOR_PATTERN = re.compile(r"^NRC[AB](?:[1-4]|LONG)$")
@@ -64,12 +64,35 @@ def group_label(info: dict) -> str:
                      info["filter"], info["pupil"])).lower()
 
 
+def _scan_onef(exp: steps.Exposure, fallback_bad: np.ndarray, *,
+               dither_attempted: bool, dither_error: str | None,
+               selection_reason: str) -> tuple[np.ndarray, dict]:
+    """Fit and record the source-unmasked single-frame scan correction."""
+    model, scan_meta = steps.scan_onef(exp.science, fallback_bad)
+    return model, {"method": "SELF", "status": "REVIEW", "applied": True,
+                   "object_mask": False,
+                   "fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
+                   "qc_accepted": None,
+                   "dither_attempted": dither_attempted,
+                   "dither_error": dither_error,
+                   "fallback_attempted": True,
+                   "fallback_reason": selection_reason,
+                   "fallback": scan_meta,
+                   "model_rms": scan_meta["model_rms"],
+                   "fit_fraction": scan_meta["fit_fraction"]}
+
+
 def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray,
              fallback_bad: np.ndarray, dither_object_mask: bool,
              peer_exclusions: list[np.ndarray], target_sources: np.ndarray,
-             peer_sources: list[np.ndarray], dither_diagnostics: bool
-             ) -> tuple[np.ndarray, dict]:
-    """Use every computable dither model; scan only when the fit cannot run."""
+             peer_sources: list[np.ndarray], dither_diagnostics: bool,
+             onef_mode: str) -> tuple[np.ndarray, dict]:
+    """Select the scan by default; optionally try dither first in auto mode."""
+    if onef_mode == "fallback":
+        return _scan_onef(exp, fallback_bad, dither_attempted=False,
+                          dither_error=None,
+                          selection_reason="selected by default fallback mode")
+
     dither_meta = None
     dither_error = None
     dither_model = None
@@ -88,29 +111,11 @@ def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray,
         dither_error = f"{type(exc).__name__}: {exc}"
 
     # Do not keep the rejected full-frame candidate alive while allocating the
-    # scan fallback; large groups can otherwise have a high peak RSS here.
+    # scan model; large groups can otherwise have a high peak RSS here.
     del dither_model
-    try:
-        # The single-frame scan fallback deliberately includes detected and
-        # extended sources and wisp-affected pixels in its profiles. Only
-        # detector-invalid pixels are excluded by the supplied mask.
-        model, fallback_meta = steps.scan_onef(exp.science, fallback_bad)
-    except Exception as exc:
-        raise ValueError(f"Dither 1/f failed ({dither_error}); single-frame "
-                         f"fallback failed ({type(exc).__name__}: {exc})") from exc
-    return model, {"method": "SELF", "status": "REVIEW", "applied": True,
-                   "object_mask": False,
-                   "fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
-                   "qc_accepted": (dither_meta["qc_accepted"]
-                                   if dither_meta is not None else None),
-                   "dither_attempted": True,
-                   "dither": dither_meta,
-                   "dither_error": dither_error,
-                   "fallback_attempted": True,
-                   "fallback_reason": dither_error,
-                   "fallback": fallback_meta,
-                   "model_rms": fallback_meta["model_rms"],
-                   "fit_fraction": fallback_meta["fit_fraction"]}
+    return _scan_onef(exp, fallback_bad, dither_attempted=True,
+                      dither_error=dither_error,
+                      selection_reason=dither_error or "dither model unavailable")
 
 
 def process_group(label: str, paths: list[str], cfg: dict) -> dict:
@@ -147,7 +152,8 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
             exp, peers, ~onef_masks[i], fallback_bad_masks[i],
             cfg["onef_object_mask"],
             [onef_masks[j] for j in peer_indices], objects[i],
-            [objects[j] for j in peer_indices], cfg["dither_diagnostics"])
+            [objects[j] for j in peer_indices], cfg["dither_diagnostics"],
+            cfg["onef_mode"])
         after_onef = exp.science - onef
         sky_mask = exp.invalid | grown[i] | ~np.isfinite(after_onef)
         if support is not None:
@@ -293,7 +299,7 @@ def run_groups(groups: dict[str, list[str]], cfg: dict, workers: int, phase: str
             fallbacks = sum(r["onef"]["method"] == "SELF"
                             for r in result["records"])
             print(f"{phase} {len(results)}/{len(groups)} {label}: dither models "
-                  f"{dither_selected}/{len(result['records'])}; scan fallbacks "
+                  f"{dither_selected}/{len(result['records'])}; scan models "
                   f"{fallbacks}; optional QC checked {qc_checked}", flush=True)
     return results, errors
 
@@ -315,11 +321,17 @@ def main() -> int:
                         help="disable source masking for registered-dither fits; the scan fallback is always source-unmasked")
     parser.add_argument("--dither-diagnostics", action="store_true",
                         help="hold out up to two peers for optional RMS diagnostics; diagnostics never gate model use")
+    parser.add_argument("--onef-mode", choices=("fallback", "auto"),
+                        default="fallback",
+                        help="fallback (default): use the single-frame keep_trend scan; "
+                             "auto: try registered dithers and scan only if fitting fails")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if args.dither_diagnostics and args.onef_mode != "auto":
+        parser.error("--dither-diagnostics requires --onef-mode auto")
 
     paths = [str(Path(line.strip()).resolve()) for line in
              args.input_list.read_text().splitlines() if line.strip()]
@@ -372,6 +384,7 @@ def main() -> int:
                           "wisp_template_groups": len(with_wisp),
                           "shortwave_with_longwave_mask": len(lw_models),
                           "workers": args.workers,
+                          "onef_mode": args.onef_mode,
                           "estimated_output_bytes": len(paths) * (2 * kept + 14 * npix),
                           "free_bytes": shutil.disk_usage(output_dir.parent).free}, indent=2))
         return 0
@@ -381,7 +394,8 @@ def main() -> int:
            "figures": not args.no_figures,
            "bkg_exclude_percentile": args.bkg_exclude_percentile, "lw_models": lw_models,
            "onef_object_mask": not args.no_onef_object_mask,
-           "dither_diagnostics": args.dither_diagnostics}
+           "dither_diagnostics": args.dither_diagnostics,
+           "onef_mode": args.onef_mode}
     print(f"Starting {len(paths)} exposures in {len(groups)} dither groups "
           f"({len(long_groups)} LW, {len(short_groups)} SW); up to {args.workers} workers",
           flush=True)
@@ -392,13 +406,17 @@ def main() -> int:
     records = sorted((r for result in results for r in result["records"]),
                      key=lambda r: r["file"])
     summary = {"stage2plus": VERSION,
-               "method": "object mask -> PHANGS-style multi-exposure dither 1/f "
-                         "or Jumprope-style scan fallback "
-                         "-> masked median "
-                         "sky -> Background2D -> NMF wisp -> pedestal; cal/ omits both sky steps",
+               "method": (
+                   ("object mask -> Jumprope-style single-frame scan 1/f "
+                    "(default); PHANGS-style multi-exposure dither is opt-in"
+                    if args.onef_mode == "fallback" else
+                    "object mask -> PHANGS-style multi-exposure dither 1/f "
+                    "or Jumprope-style scan fallback")
+                   + " -> masked median sky -> Background2D -> NMF wisp -> "
+                     "pedestal; cal/ omits both sky steps"),
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
                             "dither_min_dithers": DITHER_MIN_DITHERS,
-                            "onef_mode": "AUTO",
+                            "onef_mode": args.onef_mode.upper(),
                             "fallback_method": "PROFOUND_SCAN_KEEP_TREND",
                             "dither_diagnostics": cfg["dither_diagnostics"],
                             "onef_object_mask": cfg["onef_object_mask"],

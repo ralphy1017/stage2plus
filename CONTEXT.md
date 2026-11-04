@@ -81,7 +81,7 @@ diffuse sky mode or separation of astronomical sky from instrumental offsets.
    and FITS assembly, not dither science quality. See the [full-WCS
    mini-test](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/FULL_WCS_REPROJECTION_MINITEST_REPORT.md)
    and [wisp-unmasked rerun](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/WISP_UNMASKED_RERUN_REPORT.md).
-6. **v2.5 PHANGS-inspired multi-exposure destriping (local candidate).** The
+6. **v2.5 PHANGS-inspired multi-exposure destriping (main commit `b88d7db`).** The
    0.1-pixel centroid residual and 5% held-out RMS improvement rules no longer
    reject a computable dither model. Full-WCS reprojection is refined by a
    robust source-matched x/y translation when enough matches exist, and each
@@ -100,35 +100,46 @@ diffuse sky mode or separation of astronomical sky from instrumental offsets.
    because the reduced, held-out scene could not be fit. These diagnostics are
    not gates in the default run. See the run table below; execution results do
    not establish sky/source-flux fidelity.
+7. **v2.6 scan-default revision.** After
+   inspecting the v2.5 figures and seeing residual 1/f structure, the user
+   requested the Jumprope-style `keep_trend=True` scan as the default. The
+   registered-dither path remains available only through `--onef-mode auto`.
+   The repeated 20-exposure run selected `ONEFMETH=SELF` for every exposure,
+   applied 20 scan models, and completed with zero group errors. The user
+   reviewed its figures and requested this default be published. This run
+   validates execution and file assembly, not science quality.
 
-## Current v2.5 candidate algorithm and recorded products
+## Current v2.6 mode and recorded products
 
 `steps.read_exposure` reads `SCI_ORIG` when present, otherwise `SCI`, and
 identifies unusable pixels from DO_NOT_USE DQ (grown one pixel), nonfinite or
 zero science, and invalid ERR. Header fields `PROGRAM`, `OBSERVTN`, `VISIT`,
 `VISITGRP`, `SEQ_ID`, `ACT_ID`, `DETECTOR`, `FILTER`, and `PUPIL` define each
 group; filenames are not used to decide dither membership. Input basenames
-must be unique. A group needs at least one exposure; dither fitting is
-attempted with at least one other group exposure. Every overlapping peer is
-used by default.
+must be unique. A group needs at least one exposure. The default single-frame
+scan does not require a dither peer. `--onef-mode auto` attempts dither fitting
+when another group exposure is available and uses every overlapping peer.
 
 1. **Object and fit masks.** Photutils detects sources with at least five
    connected pixels at 2.8 times an ERR-based threshold over the image
    median. The matched
    long-wave mask is projected by WCS onto short-wave exposures when present.
    Each connected object is grown by its equivalent radius, capped at 32
-   pixels. Bad pixels and grown sources are excluded from the default dither
-   1/f fit. No bright-wisp region mask is applied in either 1/f method. The
-   sky mask still excludes invalid pixels, grown objects, and the NMF wisp
+   pixels. Bad pixels and grown sources are excluded from the optional auto
+   dither fit. The scan default excludes only detector-invalid pixels by mask;
+   source and bright-wisp pixels participate in its profiles, subject to the
+   90th-percentile clip. No bright-wisp region mask is applied in either 1/f
+   mode. The sky mask still excludes invalid pixels, grown objects, and the NMF wisp
    support grown by eight pixels during later sky estimation.
-2. **PHANGS-inspired dither 1/f and backup.** Full-WCS reprojection maps each
+2. **Optional PHANGS-inspired dither 1/f.** In `--onef-mode auto`, full-WCS
+   reprojection maps each
    peer onto the target detector grid with fractional valid-coverage handling.
    A robust median x/y shift from mutual source-mask centroids refines WCS
    registration where at least three matches exist; otherwise WCS alignment is
    used. The old 0.1-pixel residual is recorded only as a diagnostic. Each
    peer's scalar background is matched to the target using a 3σ-clipped median
    of common unmasked pixels. By default all overlapping peers form a
-   3σ-clipped median scene. The target-minus-scene residual is sigma-clipped
+   3σ-clipped median scene in auto mode. The target-minus-scene residual is sigma-clipped
    row by row in each of the four amplifier regions. The row-only model is
    anchored to preserve the target's masked global sky median. Any computable
    dither model is applied even if optional QC is false or was not run;
@@ -137,9 +148,9 @@ used by default.
    that test never selects the method. At least 10,000 valid samples on the
    stride-8 common-overlap grid are required per peer, and each amplifier must
    have measurable row offsets; peers without overlap are skipped. The single-
-   frame fallback is used only when no peer remains or the dither scene/row
-   model cannot be computed. Both outputs use the same one selected 1/f model.
-3. **Single-frame backup.** The fallback ports Jumprope's
+   scan backup is used only when no peer remains or the dither scene/row model
+   cannot be computed. Both outputs use the same one selected 1/f model.
+3. **Default single-frame scan.** The scan default ports Jumprope's
    `profoundSkyScan(..., keep_trend=True)` behavior: transpose the image into
    detector scan orientation, exclude detector-invalid pixels, and do not
    apply source or bright-wisp region masks. It still clips values above the
@@ -150,8 +161,7 @@ used by default.
    keep_trend=True)` behavior in the parent `stage2-plus.py`; it is implemented
    locally in `steps.py` with no additional dependency. It produces one `ONEF`
    map and is subtracted once. `ONEFOBJ=False` records that no source mask was
-   used. Fallback has no independent held-out QC and is marked
-   `ONEFSTAT=REVIEW`.
+   used. It has no independent held-out QC and is marked `ONEFSTAT=REVIEW`.
 4. **Sky and wisps.** The masked median is subtracted first. A
    `Background2D` residual model uses 256-pixel boxes, a 3×3 filter,
    `BiweightLocationBackground`, `SigmaClip()`, and 50% box exclusion by
@@ -167,12 +177,13 @@ used by default.
 
 The optional held-out diagnostic requires mean amplifier-row and 64-pixel tile
 RMS to improve by more than 5%, with no held-out peer worsening by more than
-5%. It is not an acceptance gate. Without `--dither-diagnostics`, `DITHQC` is
-null in JSON and omitted from the SCI header. When a computed dither model has
-`DITHQC=False` or diagnostics were not run, it is still applied and remains
-`ONEFMETH=DITHER`, `DITH1F=True`, and `ONEFSTAT=REVIEW`. `ONEFAPPL` records model subtraction;
-`DITH1F` also records whether any 1/f correction was applied. If the dither fit
-cannot be computed, a successful scan backup is selected as `ONEFMETH=SELF`.
+5%. It is not an acceptance gate. In default fallback mode, `DITHQC` is null
+in JSON and omitted from FITS because no dither check was attempted. The scan
+is recorded as `ONEFMETH=SELF`, `DITH1F=True`, `ONEFAPPL=True`, and
+`ONEFSTAT=REVIEW`. In optional auto mode, a computable dither model is applied
+even if QC fails or was not run; `ONEFAPPL` records subtraction and `DITH1F`
+records that some 1/f correction was applied. If auto dither fitting cannot
+be computed, a successful scan is selected as `ONEFMETH=SELF`.
 `S2PVER`, `ONEFMETH`, `ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `DITH1F`, `DITHQC`,
 `DITHN`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` distinguish
 method and product provenance.
@@ -187,6 +198,7 @@ method and product provenance.
 | `/data5/rzi/jp/stage2plus-test-nomask/` | Experimental local change to omit grown objects from the 1/f fit mask, same 16 inputs | 16/16 outputs, zero errors, 13/16 held-out QC passes, 2:32.56 wall time. This option was uncommitted and absent from pushed `main` when this document was written. The small test does not establish a preferred mask policy. |
 | `/data5/rzi/jp/stage2plus-phangs-v25-mini-20261103/` | Local v2.5 default all-peer PHANGS-style dither fit; 20 exposures, four groups, four leased CPUs | 20/20 each of `cal/`, `cal_sky_renorm/`, `models/`, and step figures; 20/20 dither models applied, zero fallbacks, zero group errors. Output FITS checksums passed; 280 non-SCI output HDUs matched input arrays; `cal/` model arithmetic closed exactly; masked final sky medians were within 7.3e-12 MJy/sr of zero. Execution validation only. |
 | `/data5/rzi/jp/stage2plus-phangs-v25-diag-mini-20261103/` | Separate optional `--dither-diagnostics --no-figures` run on the same 20 exposures | 14 dither models computed (5 passed, 9 failed the custom held-out 5% RMS check); 6 scan fallbacks occurred because withholding peers left an unusable reduced scene. These results do not gate the default all-peer fit. |
+| `/data5/rzi/jp/stage2plus-fallback-default-mini-20261103/` | v2.6 default scan mode, same 20 exposures, four leased CPUs | 20/20 each of `cal/`, `cal_sky_renorm/`, `models/`, and step figures; 20/20 `SELF` scan models applied; zero dither attempts and group errors. Output FITS checksums passed; 280 non-SCI HDUs matched input arrays; `cal/` model arithmetic closed exactly and masked sky medians were within 4.6e-13 MJy/sr of zero. User reviewed the figures and requested publishing the default change; execution checks do not establish science quality. |
 
 These paths are records on the development machine, **not** data shipped in
 the Git repository. The v1 input manifest is
@@ -210,6 +222,8 @@ Optional held-out diagnostics selected 6 fallbacks only because the test
 intentionally reduced the peer scene; 5 of the 14 computable dither fits
 passed the custom diagnostic and 9 failed it. These results validate
 execution, not science quality.
+The local v2.6 rerun then used the scan as the default on all 20 exposures,
+with zero dither attempts, zero group errors, and 20 `SELF` models applied.
 
 ## Practical limits and open scientific checks
 
@@ -218,7 +232,11 @@ execution, not science quality.
   long-wave mask. The current v2 code does not require a basis for every
   wisp-sensitive input; absent bases lead to `WISPMETH=NONE`. Review coverage
   before a full database run.
-- A dither scene needs enough common sky after full-WCS peer reprojection.
+- The current default scan avoids the residual dither result observed in the
+  v2.5 figures. The user reviewed the v2.6 figures and requested publishing
+  the scan default. The mini-run does not establish science quality across
+  exposures beyond this set.
+- In optional auto mode, a dither scene needs enough common sky after full-WCS peer reprojection.
   Sparse overlap or heavily masked amplifier rows can still make the fit
   impossible and invoke the scan backup. Source-match residuals are recorded
   as diagnostics, not a 0.1-pixel gate. The all-peer run proves the current
@@ -230,19 +248,19 @@ execution, not science quality.
   flat, and additive offsets. End-to-end injections into the original dither
   exposures and cross-detector sky comparisons are still needed before
   claiming local sky-surface-brightness fidelity.
-- The v2.0 verification covered 16 exposures and the local v2.5 candidate
-  covered 20; neither covers the earlier 640-exposure v1 campaign or a
+- The v2.0 verification covered 16 exposures; v2.5 and v2.6 each covered 20.
+  None covers the earlier 640-exposure v1 campaign or a
   100k-frame archive. At large scale, use a
   validated input manifest, a storage estimate, CPU and memory limits,
   isolated output directories per configuration, and staged QA. Each worker
   holds a dither group; the verification run peaked near 1.4 GB RSS for the
   measured process, and memory grows with concurrent groups. There is no
   built-in resume or cross-run product compatibility check.
-- The `--no-onef-object-mask` flag and corresponding summary setting were a
-  local uncommitted change when these docs were prepared. A clean clone of
-  the pushed v2.0 baseline does not expose that option. Do not assume a run
-  with this flag is the production default or that its `S2PVER=2.0` uniquely
-  identifies the code revision; record the Git commit and working-tree state.
+- The `--no-onef-object-mask` flag and its summary setting are included in
+  main v2.5, though they were local changes in earlier revisions. A clean
+  clone of the pushed v2.0 baseline does not expose that option. Do not assume
+  a run with this flag is the default or that `S2PVER` uniquely identifies the
+  code revision; record the Git commit and working-tree state.
 
 The operational checklist and machine-specific CPU-lease convention live in
 [AGENTS.md](AGENTS.md). The README remains the user-facing run guide.
