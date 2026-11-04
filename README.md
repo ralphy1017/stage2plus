@@ -4,8 +4,8 @@ Exposure-level cleanup of JWST NIRCam Stage 2 `cal` files before drizzling.
 It works on any NIRCam imaging program: exposures are grouped from their FITS
 headers into dither groups (same program, observation, visit, visit group,
 sequence, activity, detector, filter and pupil). Groups need at least one
-exposure. The dither method requires four; smaller groups use the single-frame
-scan backup automatically.
+exposure; a dither fit is attempted when at least one overlapping peer exists.
+The single-frame scan backup is used only when a dither model cannot be made.
 
 ## What it does
 
@@ -16,22 +16,25 @@ For every exposure, in this order:
    connected pixels). Short-wave frames add the long-wave mask of the same
    exposure, reprojected through the WCS. Each object is grown by its
    equivalent radius (at most 32 px) to cover galaxy outskirts. On wisp
-   detectors the bright-wisp region is also masked for the 1/f fit, except
-   on amplifier rows where that would leave fewer than 64 pixels.
-3. **1/f correction**: with at least four group members, other dithers are
-   shifted onto the target through their WCS, level-matched, and combined into
-   a median scene. The masked residual (target − scene) gives amplifier-row
-   and detector-column medians for the dither 1/f model. The model is selected
-   only when held-out QC passes. If dither fitting is unavailable, fails, or
-   fails QC, the dither candidate is discarded and one single-frame scan
-   model is fit instead. This backup follows Jumprope's `profoundSkyScan`
-   `keep_trend=True` behavior: upper 10% clipping, 40th-percentile scans,
-   512-row blocks, and a 501-pixel running-median trend kept in the image.
-   It uses the same DQ, object, and bright-wisp fit mask. Exactly one selected
-   1/f model is subtracted. `--no-onef-object-mask` removes sources from both
-   1/f fit masks; bad pixels and bright wisps remain masked. On the 16 test
-   exposures this left 6–14% more amplifier-row striping for the dither fit,
-   so object masking is on by default.
+   detectors, the bright-wisp region is not masked from either 1/f fit.
+3. **Dither 1/f correction**: use every overlapping peer by default. Reproject
+   through full WCS, refine the relative x/y shift from mutual source matches
+   when enough matches exist, and match each peer's background to the target
+   over common unmasked pixels. A sigma-clipped median of the registered peers
+   estimates the shared sky and sources. Subtract that scene temporarily, then
+   measure sigma-clipped residual row medians separately in each of the four
+   amplifiers. The resulting row-only model is anchored to preserve the
+   target's masked global median and is subtracted once. This follows the
+   multi-tile method in [Williams et al. (2024), §3.6.2](https://arxiv.org/html/2401.15142v3).
+   The paper's single-tile pass is not included; this reducer applies one 1/f
+   model. The former 0.1-pixel alignment and 5% held-out improvement checks
+   do not reject a computable model. Use `--dither-diagnostics` to run the
+   optional held-out RMS check; its result is recorded but never gates the
+   model. If no peer overlaps or the row model cannot be computed, the reducer
+   uses one Jumprope-style `profoundSkyScan(keep_trend=True)` single-frame
+   backup. It excludes DQ/invalid pixels, includes source and wisp pixels in
+   the scan profiles, and still clips values above the 90th percentile.
+   `--no-onef-object-mask` controls source masking for the dither fit only.
 4. **Masked median sky**: the median of pixels outside the grown objects, bad
    pixels and (on wisp detectors) the wisp template support.
 5. **Residual sky structure**: a JADES-style `photutils.Background2D` with
@@ -53,19 +56,24 @@ sky brightness from `cal_sky_renorm/`.
 Both products keep the input's PRIMARY, ERR, DQ, AREA, VAR_* and ASDF
 extensions byte for byte; only SCI is replaced. Inputs are never modified.
 
-### 1/f quality check
+### 1/f diagnostics and fallback
 
-Up to two other dithers are withheld from each target's scene, keeping at
-least two in it: eight dithers use five in the scene and hold out two; four
-dithers use two and hold out one. The check passes when the withheld
-dithers' mean amplifier-row and 64-pixel tile RMS against the target both
-improve by more than 5%, and no withheld dither gets more than 5% worse.
-`DITHQC` records this dither-only result. When dither QC fails, the candidate
-is discarded and the scan backup is selected with `ONEFSTAT=REVIEW` because
-it has no independent held-out validation. If both methods fail, the group is
-reported as an error instead of writing an uncorrected exposure. The backup
-is implemented but still needs a stratified science pilot before production
-deployment.
+Full-WCS reprojection carries valid-pixel coverage and keeps incomplete
+interpolation support out of the scene. Source matches estimate a relative
+translation; the residuals, including whether they meet the former 0.1-pixel
+criterion, are diagnostics only. By default every overlapping peer contributes
+to the sigma-clipped scene. `--dither-diagnostics` instead holds out up to two
+peers and records the prior row/tile RMS comparison, including its 5%
+thresholds, without using that outcome to select the model. With diagnostics
+off, `DITHQC` is unavailable and omitted from FITS. Because diagnostics
+withhold peers from the scene, that mode changes the fit inputs; use it only
+for validation, not as the default all-peer processing configuration. A dither
+model that is computed is applied even when optional QC fails or was not run;
+it is marked `REVIEW` unless optional QC passes. Only expected coverage or fit
+failures select the scan backup; unexpected processing errors fail the group.
+The scan fallback is selected only when the group has no usable peer or the
+dither scene/row fit cannot be computed. If both fits fail, the group reports
+an error rather than writing an uncorrected exposure.
 
 ### Background2D box exclusion
 
@@ -116,7 +124,8 @@ by filtering the list with `grep`.
 | `--workers N` | Dither groups processed in parallel, one CPU each (default 8). |
 | `--template-dir PATH` | NMF wisp bases (default `templates/`). |
 | `--bkg-exclude-percentile P` | `Background2D` `exclude_percentile` (default 50). |
-| `--no-onef-object-mask` | Do not mask objects in either 1/f fit (later steps still do). |
+| `--no-onef-object-mask` | Do not mask objects in the registered-dither fit (later steps still do). |
+| `--dither-diagnostics` | Run optional held-out row/tile RMS diagnostics; never gates dither model application. |
 | `--no-figures` | Skip the per-exposure step figures. |
 | `--plan-only` | Validate and estimate space without processing. |
 
@@ -137,7 +146,8 @@ one CPU, including figures.
 | `summary.json` | Settings and, per exposure: masks, 1/f fit and QC, sky, Background2D, wisp and pedestal measurements; group errors. |
 
 SCI headers record `S2PVER`, `STGORDER`, `ONEFMETH` (`DITHER` or `SELF`),
-`ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `DITH1F` (whether the dither method was
-selected), `DITHQC` (when measurable), `DITHN` (selected dither-scene size),
+`ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `DITH1F` (whether a 1/f correction was
+applied), `DITHQC` (when optional held-out diagnostics were run), `DITHN` (the
+number of peers in the selected scene),
 `ONEFOBJ`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH` and `PEDESTAL`.
 `summary.json` records dither attempts and fallback reasons for `SELF` fits.

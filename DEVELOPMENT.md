@@ -3,18 +3,23 @@
 **Audience:** future agents developing the standalone Stage2Plus reducer and
 its SKYSURFIR integration.
 
-**Status:** the NIRCam single-frame fallback described below is implemented
-in the local v2.1 worktree (2026-11-03), but it has not yet had a science
-pilot. The broader instrument, threshold, and database validation goals in
-this brief remain open. Do not infer full-database reliability from the code
-change alone.
+**Status:** upstream `main` commit `98f3b52` is v2.1. The local v2.5 candidate
+adapts the PHANGS multi-tile method: full-WCS reprojection with source-based
+shift refinement, overlap background matching, a sigma-clipped median scene
+using all usable peers, and sigma-clipped amplifier-row offsets. The 0.1-pixel
+and held-out 5% thresholds are optional diagnostics, not acceptance gates.
+The default 20-exposure mini-run completed with all 20 dither models applied,
+zero scan fallbacks, and zero group errors. A separate optional diagnostic
+run measured held-out residuals; its results are recorded below. These runs
+verify execution and inspectability, not sky/source-flux fidelity or
+production readiness.
 
 ## User goal
 
 The user wants 1/f correction attempted by default for every science-grade JWST
 imaging exposure in the SKYSURFIR database. Prefer a registered-dither fit
-when the data support it. Automatically try a validated per-exposure fallback
-when the dither fit cannot be made or fails its quality checks. Keep the
+when the data support it. Use a per-exposure fallback only when the dither fit
+cannot be made. Keep the
 sky-retaining `cal/` and sky-subtracted `cal_sky_renorm/` branches consistent
 with the selected correction model.
 
@@ -66,8 +71,22 @@ Jumprope settings documented below, the same object/DQ/wisp fit mask, and is
 subtracted once in both product branches. It is recorded as `ONEFMETH=SELF`,
 `ONEFAPPL=True`, and `ONEFSTAT=REVIEW`; a measurable failed dither QC remains
 `DITHQC=False`, while an unavailable check is null in JSON and omitted from
-FITS. This change was not run on the 352-exposure pilot and has not been
-independently validated.
+FITS. The v2.1 pilot ran the fallback on all 352 selected exposures with zero
+group errors. However, the dither attempts all failed before held-out QC
+because that run's `_aligned()` implementation rejected peer WCS differences
+that were not a pure shift. The run therefore tested fallback execution and
+FITS assembly, not a successful dither model or science quality.
+Representative checksums, SCI arithmetic, ERR/DQ arrays, and WCS passed. See
+the [v2.1 mini-test report](../../skysurfir/stage2plus-tests/20261103T-v21-auto-fallback/STAGE2PLUS_V21_MINITEST_REPORT.md)
+for counts, logs, outputs, and figures.
+
+The v2.1 pilot fallback used the source mask in the 1/f fit. The local v2.2
+change passes only detector-invalid and protected bright-wisp masks to the
+fallback, so detected/grown sources participate in its profiles. The
+90th-percentile high-value clip remains and can still exclude the brightest
+source pixels by value. The dither fit remains source-masked by default. The
+v2.3 mini-test exercised this fallback on 20 exposures, but this execution
+test does not validate its source-flux or diffuse-sky performance.
 
 Of the 106 exposures recorded in `summary.json`, 52 passed and 54 failed the
 held-out 1/f QC. There were 40 `Too many masked rows in an amplifier` errors,
@@ -75,13 +94,66 @@ held-out 1/f QC. There were 40 `Too many masked rows in an amplifier` errors,
 errors. Some failed groups left partial FITS and figure files; those are
 listed in `partial-products.json` and are not valid Image3 inputs.
 
-The full-WCS adaptation got past the upstream translation-only WCS rejection
-for many groups, but it did not solve missing overlap or low-sky failures.
+The earlier full-WCS adaptation got past the upstream translation-only WCS
+rejection for many groups, but it did not solve missing overlap or low-sky
+failures.
 A follow-up on 24 exposures tested `--no-onef-object-mask`, one held-out
 dither, and a test-only 85% valid-row threshold. It completed 10 exposures,
 recorded three group errors, and still had no complete group for 1727001 or
 short-wave WISP result for 2738005. **Do not treat an 85% row threshold or
 disabling the object mask as an established fix.**
+
+The local v2.3 full-WCS change and its exact mini-test outcomes are documented
+in the [full-WCS reprojection mini-test report](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/FULL_WCS_REPROJECTION_MINITEST_REPORT.md).
+It replaced the pure-shift check with target-grid reprojection and source
+centroid matching after WCS mapping. All 20 targets passed the common-overlap
+check but failed the retained maximum 0.1-pixel source-centroid tolerance
+(median matched residuals 0.63–1.38 px). Thus 6σ fit clipping, amplifier-row
+coverage, and held-out RMS gates were not reached. The mini-test completed all
+fallback products with zero group errors; it is not a successful dither
+validation. Source-centroid scatter may include segmentation variation and
+needs confirmation against bright isolated stars or independent image
+registration before changing the tolerance.
+
+The v2.4 change removes the bright-wisp region mask from both dither and
+single-frame 1/f fitting. Dither fits still exclude detector-invalid and
+grown-source pixels by default. The single-frame fallback excludes only
+detector-invalid pixels by mask and includes sources and wisps, while its
+existing upper-10% value clip remains. The same 20 exposures were rerun with
+figures enabled; all 20 products completed, all 20 selected the scan fallback,
+and the dither attempts failed at the unchanged source-alignment gate. The
+full details and figures are in the [wisp-unmasked rerun report](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/WISP_UNMASKED_RERUN_REPORT.md).
+
+The local v2.5 candidate removes the 0.1-pixel source-residual rejection and
+uses mutual source matches to refine a per-peer translation instead. It uses
+all usable peers in the default scene, matches peer backgrounds with a
+sigma-clipped overlap median, and fits sigma-clipped amplifier-row medians
+from the target-minus-scene residual. Optional held-out row/tile diagnostics
+run only with `--dither-diagnostics`; their results never select the scan
+backup. A dither fit error or no usable peer still invokes the backup. This is
+the multi-exposure component of Williams et al. (2024), §3.6.2; the separate
+single-exposure pass and extra PHANGS large-scale pass are omitted to retain
+one 1/f model in this workflow.
+
+The default v2.5 mini-run used 20 exposures in four groups (two 4-dither and
+two 6-dither groups; both modules and short/long wavelength), with four leased
+CPUs. All 20 selected `ONEFMETH=DITHER`; none selected the scan backup. The run
+wrote 20 files each in `cal/`, `cal_sky_renorm/`, `models/`, and `figures/`,
+with zero group errors. Output checksums passed; non-SCI arrays were preserved
+in 280 checked output HDUs; `cal/` arithmetic closed exactly against the saved
+`ONEF`, `WISP`, and pedestal models; masked final sky medians were within
+7.3e-12 MJy/sr of zero. Products and step figures are under
+`/data5/rzi/jp/stage2plus-phangs-v25-mini-20261103/`.
+
+A separate 20-exposure `--dither-diagnostics --no-figures` run used up to two
+held-out peers and therefore fit the remaining reduced peer set. It computed
+14 dither models (5/14 passed and 9/14 failed the custom 5% row/tile RMS
+diagnostic) and selected the scan backup for 6 targets whose reduced scene
+could not be fit. Those outcomes did not gate any model in the default run;
+they show why this optional diagnostic mode must not be confused with the
+all-peer default. Its output is at
+`/data5/rzi/jp/stage2plus-phangs-v25-diag-mini-20261103/`. Both are execution
+pilots only; visual review and sky/source-flux validation remain necessary.
 
 The plan found matching NMF WISP bases in 31 of 78 groups; 47 groups (212
 exposures) had no basis. This is a separate correction-coverage gap from 1/f.
@@ -97,23 +169,26 @@ For every exposure in the frozen science manifest, record exactly one
 per-exposure outcome. Do not require a complete four-dither group to attempt
 1/f correction.
 
-1. **Try registered-dither 1/f when eligible.** Use peers from the same
-   calibration release and compatible visit, detector, filter, and pupil.
-   Register with the complete WCS and keep a per-pixel/per-row coverage map.
-   Build the scene only from peers with valid local coverage. Keep one or more
-   independent peers for held-out validation when the group size permits.
-2. **Assess the dither model before selecting it.** Record peer coverage by
-   amplifier and row, internal and edge gaps, WCS residuals, valid fit
-   fraction, model amplitude, held-out row RMS, and tile RMS. A missing peer
-   footprint is not a measured zero. Do not extrapolate across large
-   unobserved detector regions without a validated maximum-gap rule.
-3. **Per-exposure backup.** The local v2.1 worktree now implements an
-   object- and DQ-masked single-exposure scan correction based on the
+1. **Try registered-dither 1/f when eligible.** Use every usable peer from
+   the same calibration release and compatible visit, detector, filter, and
+   pupil. Register with the complete WCS and keep a per-pixel coverage map.
+   Build the scene only from peers with valid local coverage. One usable peer
+   is sufficient to attempt a fit; if none overlap, use the backup.
+2. **Record diagnostics without making them prerequisites.** Record peer
+   coverage by amplifier and row, WCS/source-match residuals, valid fit
+   fraction, model amplitude, and optional held-out row/tile RMS. A missing
+   peer footprint is not a measured zero. Do not reject a computable all-peer
+   model based on the historical 0.1-pixel or 5% criteria. The optional
+   `--dither-diagnostics` mode withholds peers and changes the scene being fit;
+   use it to measure transfer to held-out peers, not as the default.
+3. **Per-exposure backup.** The local v2.5 worktree implements an
+   invalid-pixel-masked, source- and wisp-unmasked scan correction based on the
    NEP/JumproPe `scan_1f(..., keep_trend=True)` behavior referenced by
    [`../stage2-plus.py`](../stage2-plus.py). The implementation is pinned in
    `steps.py`; it does not rely on an external JumproPe runtime. It is selected
-   when the group is too small for dither QC, dither fitting raises, or
-   dither QC fails. Exactly one selected model is subtracted in both output
+   when no usable peer exists or dither fitting raises. A failed optional
+   held-out diagnostic does not discard a computed dither model. Exactly one
+   selected model is subtracted in both output
    branches. Validate source flux and diffuse-sky recovery before treating
    this fallback as production-ready.
 4. **Use a hybrid model only when its parts are explicit.** If the dither fit
@@ -139,22 +214,24 @@ Suggested provenance fields:
 | `ONEFMETH` | `DITHER`, `SELF`, `HYBRID`, or `NONE` |
 | `ONEFSTAT` | `PASS`, `REVIEW`, `HOLD`, or `FAILED` for the selected method |
 | `ONEFAPPL` | Whether the selected 1/f model was subtracted |
-| `DITHQC` | Dither-only held-out result; null in JSON and omitted from FITS when the check was unavailable |
+| `DITHQC` | Optional dither-only held-out result; null in JSON and omitted from FITS when diagnostics were not run or unavailable |
 | `DITHN` | Peer count used in the selected dither scene |
 | `ONEFCOV` | Valid local coverage summary; detailed maps belong in QA/model products |
 | `ONEFVER` | Algorithm version or source revision |
 
-Keep `DITH1F` as the existing dither-method indicator. Do not encode a
-per-exposure fallback as `DITHQC=False`; that means a dither QC failure, not
-“dither method not selected.” Update `summary.json` with attempted methods,
+Keep `DITH1F` as the 1/f correction-applied flag; `ONEFMETH` identifies the
+selected method. `DITHQC=False` means an applied dither model failed the
+optional diagnostic; it never means the fallback was selected. Update
+`summary.json` with attempted methods,
 fallback reason, thresholds, masks, per-amplifier coverage, before/after
 residuals, and the final selected method for every exposure.
 
 ## Threshold development
 
-The user wants dithered 1/f to work on all exposures and is open to more
-relaxed thresholds. Treat thresholds as a measured policy, not a way to make
-the error count disappear.
+The user wants dithered 1/f attempted by default on all eligible exposures.
+The historical 0.1-pixel and held-out 5% tests are custom diagnostics, not
+PHANGS acceptance requirements. Treat any additional feasibility thresholds
+as measured policy, not a way to make the error count disappear.
 
 - Parameterize minimum valid fit fraction, peer overlap, valid rows per
 amplifier, allowable contiguous row gaps, WCS registration residual, minimum
@@ -208,8 +285,13 @@ completed products.
 
 ## Implementation order
 
-1. Add full-WCS alignment and coverage diagnostics in an isolated branch; test
-   alignment residuals and flux/noise behavior before broad use.
+1. **Implemented locally in v2.5:** add full-WCS peer SCI reprojection,
+   conservative valid/exclusion coverage mapping, robust source-based
+   translation refinement, overlap background matching, sigma-clipped
+   all-peer scene construction, and sigma-clipped per-amplifier row fits. The
+   20-exposure default mini-run selected dither for every target with zero
+   group errors; next validate residual striping, source flux, and diffuse-sky
+   preservation before broad use.
 2. Refactor dither fitting to return structured feasibility and QC results,
    not just a model or exception. Preserve diagnostics for rows and
    amplifiers without peer coverage.
@@ -227,4 +309,8 @@ completed products.
 - Current science method and history: [`CONTEXT.md`](CONTEXT.md)
 - Operational rules for future agents: [`AGENTS.md`](AGENTS.md)
 - Pilot report and results: [`SKYSURFIR visit pilot`](../../skysurfir/stage2plus-tests/20261103T181509Z-visits-1176231-2738005-1727001/STAGE2PLUS_VISIT_PILOT_REPORT.md)
+- v2.1 fallback mini-test: [`Stage2Plus v2.1 mini-test`](../../skysurfir/stage2plus-tests/20261103T-v21-auto-fallback/STAGE2PLUS_V21_MINITEST_REPORT.md)
+- v2.4 wisp-unmasked rerun: [`Stage2Plus wisp-unmasked mini-test`](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/WISP_UNMASKED_RERUN_REPORT.md)
+- The local v2.5 changes are uncommitted and not present in upstream `main`.
+  The mini-runs establish execution only, not scientific validation.
 - Parent JumProPe history: [`../handoff.md`](../handoff.md)

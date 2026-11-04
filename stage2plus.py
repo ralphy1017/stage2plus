@@ -2,9 +2,10 @@
 """Stage 2 plus: clean JWST NIRCam dither groups before drizzling.
 
 For each exposure in a dither group (same visit, detector, filter and pupil)
-it writes two products from the input science. Registered dither fitting is
-used with at least four dithers; failed or QC-rejected fits use a masked
-Jumprope-style single-frame scan fallback:
+it writes two products from the input science. The default 1/f model uses all
+overlapping peers, full-WCS registration, background matching, a sigma-clipped
+median scene, and sigma-clipped per-amplifier row offsets. The single-frame
+scan is used only when a dither model cannot be computed:
 
   cal_sky_renorm/  photutils object mask -> registered-dither 1/f -> masked
                    median sky -> Background2D residual sky -> NMF wisp (where
@@ -43,9 +44,9 @@ from scipy import ndimage as ndi
 import steps
 from figures import plot_steps
 
-VERSION = "2.1"
+VERSION = "2.5"
 MIN_DITHERS = 1
-DITHER_MIN_DITHERS = 4
+DITHER_MIN_DITHERS = 2
 DETECTOR_PATTERN = re.compile(r"^NRC[AB](?:[1-4]|LONG)$")
 VISIT_KEYS = ("PROGRAM", "OBSERVTN", "VISIT", "VISITGRP", "SEQ_ID", "ACT_ID")
 
@@ -63,33 +64,43 @@ def group_label(info: dict) -> str:
                      info["filter"], info["pupil"])).lower()
 
 
-def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray
+def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray,
+             fallback_bad: np.ndarray, dither_object_mask: bool,
+             peer_exclusions: list[np.ndarray], target_sources: np.ndarray,
+             peer_sources: list[np.ndarray], dither_diagnostics: bool
              ) -> tuple[np.ndarray, dict]:
-    """Select one 1/f model: validated dither first, scan fallback otherwise."""
+    """Use every computable dither model; scan only when the fit cannot run."""
     dither_meta = None
     dither_error = None
     dither_model = None
     try:
-        dither_model, dither_meta = steps.dither_onef(exp, peers, good)
-        if dither_meta["qc_accepted"]:
-            return dither_model, {**dither_meta, "method": "DITHER",
-                                  "status": "PASS", "applied": True,
-                                  "dither_attempted": True,
-                                  "fallback_attempted": False,
-                                  "fallback_reason": None}
-        dither_error = "held-out dither 1/f QC failed"
-    except Exception as exc:
+        dither_model, dither_meta = steps.dither_onef(
+            exp, peers, good, peer_exclusions, target_sources, peer_sources,
+            diagnostics=dither_diagnostics)
+        status = "PASS" if dither_meta["qc_accepted"] is True else "REVIEW"
+        return dither_model, {**dither_meta, "method": "DITHER",
+                              "status": status, "applied": True,
+                              "object_mask": dither_object_mask,
+                              "dither_attempted": True,
+                              "fallback_attempted": False,
+                              "fallback_reason": None}
+    except (ValueError, FloatingPointError) as exc:
         dither_error = f"{type(exc).__name__}: {exc}"
 
     # Do not keep the rejected full-frame candidate alive while allocating the
     # scan fallback; large groups can otherwise have a high peak RSS here.
     del dither_model
     try:
-        model, fallback_meta = steps.scan_onef(exp.science, ~good)
+        # The single-frame scan fallback deliberately includes detected and
+        # extended sources and wisp-affected pixels in its profiles. Only
+        # detector-invalid pixels are excluded by the supplied mask.
+        model, fallback_meta = steps.scan_onef(exp.science, fallback_bad)
     except Exception as exc:
         raise ValueError(f"Dither 1/f failed ({dither_error}); single-frame "
                          f"fallback failed ({type(exc).__name__}: {exc})") from exc
     return model, {"method": "SELF", "status": "REVIEW", "applied": True,
+                   "object_mask": False,
+                   "fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
                    "qc_accepted": (dither_meta["qc_accepted"]
                                    if dither_meta is not None else None),
                    "dither_attempted": True,
@@ -110,7 +121,7 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
     basis = steps.load_basis(template, exposures[0].science.shape) if template else None
 
     # 1. Object masks: own segmentation plus the matching long-wave mask.
-    objects, grown, onef_masks = [], [], []
+    objects, grown, onef_masks, fallback_bad_masks = [], [], [], []
     for exp in exposures:
         mask = steps.segment(exp)
         lw_models = cfg["lw_models"].get(exp.path.name)
@@ -121,19 +132,22 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
         objects.append(mask)
         grown.append(steps.grow_mask(mask))
         onef = (exp.invalid | grown[-1]) if cfg["onef_object_mask"] else exp.invalid.copy()
-        if basis is not None:
-            onef = steps.protect_wisp(onef, basis[2])
-        if onef.mean() > 0.5:
-            raise ValueError(f"Too little clean area for 1/f: {exp.path.name}")
+        fallback_bad = exp.invalid.copy()
         onef_masks.append(onef)
+        fallback_bad_masks.append(fallback_bad)
 
     records = []
     support = (ndi.binary_dilation(basis[1], iterations=steps.WISP_SUPPORT_GROWTH)
                if basis is not None else None)
     for i, exp in enumerate(exposures):
-        # 2. Registered-dither 1/f, with one masked scan fallback if needed.
-        onef, onef_meta = fit_onef(exp, exposures[:i] + exposures[i + 1:],
-                                   ~onef_masks[i])
+        # 2. Registered-dither 1/f, with a source-unmasked scan fallback.
+        peer_indices = [j for j in range(len(exposures)) if j != i]
+        peers = [exposures[j] for j in peer_indices]
+        onef, onef_meta = fit_onef(
+            exp, peers, ~onef_masks[i], fallback_bad_masks[i],
+            cfg["onef_object_mask"],
+            [onef_masks[j] for j in peer_indices], objects[i],
+            [objects[j] for j in peer_indices], cfg["dither_diagnostics"])
         after_onef = exp.science - onef
         sky_mask = exp.invalid | grown[i] | ~np.isfinite(after_onef)
         if support is not None:
@@ -166,11 +180,11 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                  "ONEFMETH": (onef_meta["method"], "selected 1/f method"),
                  "ONEFSTAT": (onef_meta["status"], "selected method QC status"),
                  "ONEFAPPL": (onef_meta["applied"], "1/f model subtracted"),
-                 "ONEFVER": ("DITH-V2" if onef_meta["method"] == "DITHER"
-                             else "SCAN-KT1", "selected 1/f implementation"),
-                 "DITH1F": (onef_meta["method"] == "DITHER",
-                            "registered-dither model selected"),
-                 "ONEFOBJ": (cfg["onef_object_mask"], "objects masked in the 1/f fit"),
+                 "ONEFVER": ("DITH-PH25" if onef_meta["method"] == "DITHER"
+                             else "SCAN-KT3", "selected 1/f implementation"),
+                 "DITH1F": (onef_meta["applied"], "1/f correction applied"),
+                 "ONEFOBJ": (onef_meta["object_mask"],
+                             "objects masked in selected 1/f fit"),
                  "SKYMED": (sky_median, "masked median sky (MJy/sr)"),
                  "WISPMETH": ("NMF" if wisp is not None else "NONE", "wisp model"),
                  "PEDESTAL": (pedestal, "post-wisp masked median removed (MJy/sr)")}
@@ -198,7 +212,9 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                        f"{name} | {detector} {band} | 1/f {onef_meta['method']} "
                        f"({onef_meta['status']})",
                        [("Input SCI", exp.science, "sky"),
-                        ("Object mask (black), sky mask (grey)",
+                        (("Source mask shown (not used by SELF); sky mask (grey)"
+                          if onef_meta["method"] == "SELF" else
+                          "Object mask (black), sky mask (grey)"),
                          sky_mask.astype(np.uint8) + objects[i], "mask"),
                         (f"{onef_meta['method']} 1/f model", onef, "model"),
                         ("After 1/f", after_onef, "sky"),
@@ -231,10 +247,11 @@ def write_models(exp, path: Path, objects, sky_mask, onef, background, wisp,
     primary.header["ONEFMETH"] = (onef_meta["method"], "selected 1/f method")
     primary.header["ONEFSTAT"] = (onef_meta["status"], "selected method QC status")
     primary.header["ONEFAPPL"] = (onef_meta["applied"], "1/f model subtracted")
-    primary.header["ONEFVER"] = ("DITH-V2" if onef_meta["method"] == "DITHER"
-                                  else "SCAN-KT1", "selected 1/f implementation")
-    primary.header["DITH1F"] = (onef_meta["method"] == "DITHER",
-                                "registered-dither model selected")
+    primary.header["ONEFVER"] = ("DITH-PH25" if onef_meta["method"] == "DITHER"
+                                  else "SCAN-KT3", "selected 1/f implementation")
+    primary.header["ONEFOBJ"] = (onef_meta["object_mask"],
+                                  "objects masked in selected 1/f fit")
+    primary.header["DITH1F"] = (onef_meta["applied"], "1/f correction applied")
     if onef_meta["qc_accepted"] is not None:
         primary.header["DITHQC"] = (onef_meta["qc_accepted"], "dither QC passed")
     hdus = [primary,
@@ -269,13 +286,15 @@ def run_groups(groups: dict[str, list[str]], cfg: dict, workers: int, phase: str
                 print(f"{phase} FAILED {label}: {exc}", file=sys.stderr, flush=True)
                 continue
             results.append(result)
-            qc_passed = sum(r["onef"]["qc_accepted"] is True
-                            for r in result["records"])
+            qc_checked = sum(r["onef"]["qc_accepted"] is not None
+                             for r in result["records"])
+            dither_selected = sum(r["onef"]["method"] == "DITHER"
+                                  for r in result["records"])
             fallbacks = sum(r["onef"]["method"] == "SELF"
                             for r in result["records"])
-            print(f"{phase} {len(results)}/{len(groups)} {label}: dither QC "
-                  f"passed {qc_passed}/{len(result['records'])}; "
-                  f"scan fallbacks {fallbacks}", flush=True)
+            print(f"{phase} {len(results)}/{len(groups)} {label}: dither models "
+                  f"{dither_selected}/{len(result['records'])}; scan fallbacks "
+                  f"{fallbacks}; optional QC checked {qc_checked}", flush=True)
     return results, errors
 
 
@@ -293,7 +312,9 @@ def main() -> int:
                         help="Background2D exclude_percentile: skip boxes with more than "
                              "this percent masked (default 50; photutils default 10)")
     parser.add_argument("--no-onef-object-mask", action="store_true",
-                        help="fit 1/f masking only bad pixels (and bright wisps), not objects")
+                        help="disable source masking for registered-dither fits; the scan fallback is always source-unmasked")
+    parser.add_argument("--dither-diagnostics", action="store_true",
+                        help="hold out up to two peers for optional RMS diagnostics; diagnostics never gate model use")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
@@ -359,7 +380,8 @@ def main() -> int:
     cfg = {"output_dir": str(output_dir), "template_dir": str(args.template_dir.resolve()),
            "figures": not args.no_figures,
            "bkg_exclude_percentile": args.bkg_exclude_percentile, "lw_models": lw_models,
-           "onef_object_mask": not args.no_onef_object_mask}
+           "onef_object_mask": not args.no_onef_object_mask,
+           "dither_diagnostics": args.dither_diagnostics}
     print(f"Starting {len(paths)} exposures in {len(groups)} dither groups "
           f"({len(long_groups)} LW, {len(short_groups)} SW); up to {args.workers} workers",
           flush=True)
@@ -370,14 +392,30 @@ def main() -> int:
     records = sorted((r for result in results for r in result["records"]),
                      key=lambda r: r["file"])
     summary = {"stage2plus": VERSION,
-               "method": "photutils object mask -> dither 1/f or Jumprope-style scan fallback "
+               "method": "object mask -> PHANGS-style multi-exposure dither 1/f "
+                         "or Jumprope-style scan fallback "
                          "-> masked median "
                          "sky -> Background2D -> NMF wisp -> pedestal; cal/ omits both sky steps",
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
                             "dither_min_dithers": DITHER_MIN_DITHERS,
                             "onef_mode": "AUTO",
                             "fallback_method": "PROFOUND_SCAN_KEEP_TREND",
+                            "dither_diagnostics": cfg["dither_diagnostics"],
                             "onef_object_mask": cfg["onef_object_mask"],
+                            "fallback_object_mask": False,
+                            "dither_fit_mask": ("INVALID+SOURCE; WISP INCLUDED"
+                                                if cfg["onef_object_mask"]
+                                                else "INVALID ONLY; SOURCES+WISP INCLUDED"),
+                            "fallback_fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
+                            "dither_wisp_mask": False,
+                            "fallback_wisp_mask": False,
+                            "dither_reprojection": "full WCS plus matched-source translation",
+                            "dither_scene": "sigma-clipped median of all overlapping peers by default",
+                            "dither_row_model": "sigma-clipped row median per amplifier",
+                            "reproject_valid_coverage_min": steps.REPROJECT_VALID_COVERAGE,
+                            "source_alignment_tolerance_px": steps.SOURCE_ALIGNMENT_TOL_PIXELS,
+                            "source_match_radius_px": steps.SOURCE_MATCH_RADIUS_PIXELS,
+                            "min_source_alignment_matches": steps.MIN_SOURCE_ALIGNMENT_MATCHES,
                             "segment_nsigma": steps.SEGMENT_NSIGMA,
                             "mask_growth_cap": steps.MASK_GROWTH_CAP,
                             "wisp_support_growth": steps.WISP_SUPPORT_GROWTH,

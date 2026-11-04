@@ -19,6 +19,7 @@ from photutils.background import Background2D, BiweightLocationBackground
 from photutils.segmentation import detect_sources
 from scipy import ndimage as ndi
 from scipy.optimize import nnls
+from scipy.spatial import cKDTree
 
 # HDUs copied from each input into the output FITS.
 KEEP_HDUS = ("PRIMARY", "SCI", "ERR", "DQ", "AREA", "VAR_POISSON",
@@ -28,9 +29,14 @@ SEGMENT_NSIGMA = 2.8
 MASK_GROWTH_CAP = 32       # pixels
 WISP_SUPPORT_GROWTH = 8    # pixels excluded around the wisp template support
 MAX_HELDOUT = 2            # dithers withheld from each 1/f scene for QC
-MIN_DITHER_SCENE_PEERS = 2
+MIN_DITHER_SCENE_PEERS = 1
 SCAN_BLOCK_ROWS = 512
 SCAN_TREND_BLOCK = 501
+REPROJECT_ROWS = 128
+REPROJECT_VALID_COVERAGE = 1.0 - 1e-6
+SOURCE_MATCH_RADIUS_PIXELS = 5.0
+SOURCE_ALIGNMENT_TOL_PIXELS = 0.1
+MIN_SOURCE_ALIGNMENT_MATCHES = 3
 
 # JADES per-exposure background: photutils.Background2D with these settings.
 BKG_BOX = (256, 256)
@@ -136,68 +142,197 @@ def project_mask(mask: np.ndarray, mask_header: fits.Header, target: Exposure) -
     return out
 
 
-def protect_wisp(mask: np.ndarray, high_wisp: np.ndarray, min_row_pixels: int = 64) -> np.ndarray:
-    """Add the bright-wisp region unless it empties an amplifier row."""
-    out = mask | high_wisp
-    width = mask.shape[1] // 4
-    for lo in range(0, mask.shape[1], width):
-        sparse = np.count_nonzero(~out[:, lo:lo + width], axis=1) < min_row_pixels
-        out[sparse, lo:lo + width] = mask[sparse, lo:lo + width]
-    return out
-
-
 # Registered-dither 1/f ------------------------------------------------------
 
-def _aligned(peer: Exposure, target: Exposure, good: np.ndarray) -> np.ndarray:
-    """Peer shifted onto the target's pixels, its scalar level matched."""
+def _source_centroids(mask: np.ndarray) -> np.ndarray:
+    """Return x,y centroids of the source segments used for alignment checks."""
+    labels, count = ndi.label(mask)
+    if count == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    areas = np.bincount(labels.ravel())
+    ids = np.flatnonzero(areas[1:] >= 5) + 1
+    if not ids.size:
+        return np.empty((0, 2), dtype=np.float64)
+    centers_yx = np.asarray(ndi.center_of_mass(mask, labels, ids), dtype=np.float64)
+    return centers_yx[:, ::-1]
+
+
+def _source_alignment(peer: Exposure, target: Exposure,
+                      peer_sources: np.ndarray, target_sources: np.ndarray) -> dict:
+    """Estimate a robust peer-to-target pixel shift from mutual source matches.
+
+    Full-WCS coordinates provide the initial alignment. A median translation
+    from mutual nearest source centroids refines it, like the relative shift
+    correction used before PHANGS multi-tile destriping. The old 0.1-pixel
+    residual is recorded as a diagnostic and never rejects the peer.
+    """
+    peer_xy = _source_centroids(peer_sources)
+    target_xy = _source_centroids(target_sources)
+    if not len(peer_xy) or not len(target_xy):
+        return {"status": "WCS_ONLY", "matches": 0,
+                "correction_x_px": 0.0, "correction_y_px": 0.0,
+                "reason": "no source centroids in one or both exposures"}
+
+    world = peer.wcs.all_pix2world(peer_xy, 0)
+    mapped_xy = target.wcs.all_world2pix(world, 0)
     ny, nx = target.science.shape
-    xy = np.array([[nx / 2, ny / 2], [100, 100], [nx - 100, 100],
-                   [100, ny - 100], [nx - 100, ny - 100]], float)
-    delta = peer.wcs.all_world2pix(target.wcs.all_pix2world(xy, 0), 0) - xy
-    if np.max(np.linalg.norm(delta - delta[0], axis=1)) > 0.1:
-        raise ValueError(f"WCS of {peer.path.name} differs by more than a shift")
-    # scipy's shift samples input[p - shift] at output p.
-    aligned = ndi.shift(np.where(peer.invalid, np.nan, peer.science),
-                        (-delta[0, 1], -delta[0, 0]), order=1, mode="constant",
-                        cval=np.nan, prefilter=False, output=np.float32)
+    finite = (np.isfinite(mapped_xy).all(axis=1) &
+              (mapped_xy[:, 0] >= 0) & (mapped_xy[:, 0] < nx) &
+              (mapped_xy[:, 1] >= 0) & (mapped_xy[:, 1] < ny))
+    mapped_xy = mapped_xy[finite]
+    if not len(mapped_xy):
+        return {"status": "WCS_ONLY", "matches": 0,
+                "correction_x_px": 0.0, "correction_y_px": 0.0,
+                "reason": "no peer source centroids project onto target grid"}
+
+    target_tree = cKDTree(target_xy)
+    peer_tree = cKDTree(mapped_xy)
+    to_target, target_index = target_tree.query(mapped_xy, k=1)
+    _, peer_index = peer_tree.query(target_xy, k=1)
+    peers = np.arange(len(mapped_xy))
+    mutual = ((peer_index[target_index] == peers) &
+              (to_target <= SOURCE_MATCH_RADIUS_PIXELS))
+    offsets = target_xy[target_index[mutual]] - mapped_xy[mutual]
+    if len(offsets) < MIN_SOURCE_ALIGNMENT_MATCHES:
+        return {"status": "WCS_ONLY", "matches": int(len(offsets)),
+                "correction_x_px": 0.0, "correction_y_px": 0.0,
+                "reason": f"fewer than {MIN_SOURCE_ALIGNMENT_MATCHES} mutual source matches"}
+
+    keep = np.ones(len(offsets), dtype=bool)
+    for _ in range(4):
+        shift = np.median(offsets[keep], axis=0)
+        scatter = np.linalg.norm(offsets - shift, axis=1)
+        limit = max(1.0, 3.0 * robust_sigma(scatter[keep]))
+        updated = scatter <= limit
+        if updated.sum() < MIN_SOURCE_ALIGNMENT_MATCHES or np.array_equal(updated, keep):
+            break
+        keep = updated
+    shift = np.median(offsets[keep], axis=0)
+    residuals = np.linalg.norm(offsets[keep] - shift, axis=1)
+    pre_residuals = np.linalg.norm(offsets[keep], axis=1)
+    return {"status": "SHIFT_APPLIED" if np.any(np.abs(shift) > 0.01) else "WCS_OK",
+            "matches": int(keep.sum()),
+            "correction_x_px": float(shift[0]),
+            "correction_y_px": float(shift[1]),
+            "pre_correction_median_px": float(np.median(pre_residuals)),
+            "post_correction_median_px": float(np.median(residuals)),
+            "post_correction_p95_px": float(np.percentile(residuals, 95)),
+            "post_correction_max_px": float(np.max(residuals)),
+            "old_0p1px_gate_passed": bool(np.max(residuals) <= SOURCE_ALIGNMENT_TOL_PIXELS),
+            "diagnostic_tolerance_px": SOURCE_ALIGNMENT_TOL_PIXELS}
+
+
+def _aligned(peer: Exposure, target: Exposure, good: np.ndarray,
+             peer_exclusion: np.ndarray, peer_sources: np.ndarray,
+             target_sources: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict, dict]:
+    """Full-WCS reproject peer SCI to target grid, conserving valid coverage.
+
+    Bilinear SCI samples are normalized by their valid interpolation weight.
+    A sample is usable only when all contributing source pixels are valid and
+    unexcluded; partial and missing coverage remain NaN in the aligned image.
+    """
+    ny, nx = target.science.shape
+    py, px = peer.science.shape
+    alignment = _source_alignment(peer, target, peer_sources, target_sources)
+    dx = alignment["correction_x_px"]
+    dy = alignment["correction_y_px"]
+    source_valid = (~peer.invalid & ~peer_exclusion &
+                    np.isfinite(peer.science))
+    source_values = np.where(source_valid, peer.science, 0).astype(np.float32)
+    source_weights = source_valid.astype(np.float32)
+    aligned = np.full((ny, nx), np.nan, dtype=np.float32)
+    valid_coverage = np.zeros((ny, nx), dtype=np.float32)
+    footprint = np.zeros((ny, nx), dtype=bool)
+
+    for y0 in range(0, ny, REPROJECT_ROWS):
+        y1 = min(y0 + REPROJECT_ROWS, ny)
+        yy, xx = np.mgrid[y0:y1, 0:nx]
+        # A positive source correction moves peer data toward +x,+y in the
+        # target frame, so sample the inverse shift on the output grid.
+        xx = xx - dx
+        yy = yy - dy
+        xy = np.column_stack((xx.ravel(), yy.ravel()))
+        world = target.wcs.all_pix2world(xy, 0)
+        peer_xy = peer.wcs.all_world2pix(world, 0)
+        sx = peer_xy[:, 0].reshape(y1 - y0, nx)
+        sy = peer_xy[:, 1].reshape(y1 - y0, nx)
+        geometric = (np.isfinite(sx) & np.isfinite(sy) & (sx >= 0) &
+                     (sx <= px - 1) & (sy >= 0) & (sy <= py - 1))
+        safe_sx = np.where(geometric, sx, -1e6)
+        safe_sy = np.where(geometric, sy, -1e6)
+        coords = [safe_sy, safe_sx]
+        values = ndi.map_coordinates(source_values, coords, order=1,
+                                     mode="constant", cval=0, prefilter=False)
+        weights = ndi.map_coordinates(source_weights, coords, order=1,
+                                      mode="constant", cval=0, prefilter=False)
+        usable = geometric & (weights >= REPROJECT_VALID_COVERAGE)
+        block_coverage = valid_coverage[y0:y1]
+        block_coverage[:] = np.where(geometric, weights, 0)
+        footprint[y0:y1] = geometric
+        aligned_block = aligned[y0:y1]
+        aligned_block[usable] = values[usable] / weights[usable]
+
     sample = np.s_[::8, ::8]
-    valid = good[sample] & np.isfinite(aligned[sample])
-    if valid.sum() < 10000:
-        raise ValueError(f"Too little dither overlap with {peer.path.name}")
-    aligned -= np.float32(np.median((aligned[sample] - target.science[sample])[valid]))
-    return aligned
+    common = good[sample] & np.isfinite(aligned[sample])
+    if common.sum() < 10000:
+        raise ValueError(f"Too little dither overlap with {peer.path.name}: "
+                         f"{int(common.sum())} stride-8 samples; requires 10000")
+    background_offset = _sigma_clipped_median(
+        aligned[sample][common] - target.science[sample][common])
+    aligned -= np.float32(background_offset)
+    stats = {"geometric_coverage": float(footprint.mean()),
+             "full_valid_coverage": float(np.mean(valid_coverage >= REPROJECT_VALID_COVERAGE)),
+             "partial_coverage": float(np.mean((valid_coverage > 0) &
+                                                (valid_coverage < REPROJECT_VALID_COVERAGE))),
+             "overlap_stride8_samples": int(common.sum()),
+             "background_offset": background_offset}
+    return aligned, valid_coverage, alignment, stats
+
+
+def _sigma_clipped_median(values: np.ndarray, sigma: float = 3.0) -> float:
+    values = np.asarray(values, dtype=np.float32)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        raise ValueError("No finite samples for sigma-clipped median")
+    clipped = SigmaClip(sigma=sigma, maxiters=5)(values, masked=True, copy=False)
+    retained = clipped.compressed()
+    if not retained.size:
+        raise ValueError("Sigma clipping removed all samples")
+    return float(np.median(retained))
 
 
 def fit_stripes(target: np.ndarray, scene: np.ndarray,
                 good: np.ndarray) -> tuple[np.ndarray, dict]:
-    """Amplifier-row plus column medians of target - scene, zero mean on sky."""
+    """PHANGS multi-tile model: sigma-clipped row offsets per amplifier."""
     residual = target - scene
     valid = good & np.isfinite(residual)
-    centre = float(np.median(residual[valid][::8]))
-    sigma = robust_sigma(residual[valid][::8])
-    valid &= np.abs(residual - centre) < 6 * sigma
-    if valid.mean() < 0.5:
-        raise ValueError("Too few sky pixels to fit 1/f")
-    residual -= np.float32(centre)
-    residual[~valid] = np.nan
+    if valid.sum() < 1000:
+        raise ValueError("Too few common sky pixels to fit dither 1/f")
     ny, nx = target.shape
-    rows = np.empty_like(target)
+    model = np.zeros_like(target, dtype=np.float32)
+    row_coverage = {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        for lo in range(0, nx, nx // 4):
-            profile = np.nanmedian(residual[:, lo:lo + nx // 4], axis=1)
+        for amp in range(4):
+            lo = amp * nx // 4
+            hi = (amp + 1) * nx // 4
+            data = np.where(valid[:, lo:hi], residual[:, lo:hi], np.nan)
+            clipped = SigmaClip(sigma=3.0, maxiters=5)(
+                data, axis=1, masked=True, copy=False)
+            profile = np.ma.median(clipped, axis=1).filled(np.nan)
             finite = np.isfinite(profile)
-            if finite.sum() < 0.9 * ny:
-                raise ValueError("Too many masked rows in an amplifier")
-            rows[:, lo:lo + nx // 4] = np.interp(np.arange(ny), np.flatnonzero(finite),
-                                                 profile[finite])[:, None]
-        columns = np.nan_to_num(np.nanmedian(residual - rows, axis=0), nan=0)
-    model = (rows + columns[None, :]).astype(np.float32)
+            row_coverage[f"A{amp + 1}"] = float(finite.mean())
+            if not finite.any():
+                raise ValueError(f"No measurable dither row offsets in amplifier {amp + 1}")
+            profile = np.interp(np.arange(ny), np.flatnonzero(finite), profile[finite])
+            model[:, lo:hi] = profile[:, None]
     # The fit cannot see a global offset: keep the input's masked sky median.
     model -= np.float32(np.median(model[good]))
     model += np.float32(np.median((target - model)[good]) - np.median(target[good]))
     model[~np.isfinite(target)] = 0
-    return model, {"residual_sigma": sigma, "fit_fraction": float(valid.mean()),
+    return model, {"residual_sigma": robust_sigma(residual[valid][::8]),
+                   "fit_fraction": float(valid.mean()),
+                   "amplifier_row_coverage": row_coverage,
                    "model_rms": float(np.sqrt(np.mean(model[good] ** 2)))}
 
 
@@ -224,47 +359,100 @@ def _tile_rms(diff: np.ndarray, good: np.ndarray, size: int = 64) -> float:
         return float(np.sqrt(np.nanmean(np.nanmedian(tiles, axis=(1, 3)) ** 2)))
 
 
-def dither_onef(target: Exposure, peers: list[Exposure],
-                good: np.ndarray) -> tuple[np.ndarray, dict]:
-    """1/f model of target from a registered median scene of its other dithers.
+def dither_onef(target: Exposure, peers: list[Exposure], good: np.ndarray,
+                peer_exclusions: list[np.ndarray], target_sources: np.ndarray,
+                peer_sources: list[np.ndarray],
+                diagnostics: bool = False) -> tuple[np.ndarray, dict]:
+    """Fit amplifier-row offsets from a sigma-clipped median dither scene.
 
-    Up to MAX_HELDOUT peers (keeping at least two in the scene) are withheld.
-    QC passes when their mean amplifier-row and 64-pixel tile RMS against the
-    target both improve by more than 5% and no withheld peer worsens by more
-    than 5%. A QC failure returns its candidate and diagnostics; the caller
-    must select the single-frame fallback instead of applying that candidate.
+    The default scene uses every overlapping peer. Optional held-out checks
+    are diagnostics only and never decide whether a computable model is used.
+    Missing or excluded interpolation support stays NaN, never zero sky.
     """
-    if len(peers) < MIN_DITHER_SCENE_PEERS + 1:
-        raise ValueError("Dither 1/f requires at least two scene peers and one held-out peer")
-    n_fit = max(2, len(peers) - MAX_HELDOUT)
-    fit_peers, heldout = peers[:n_fit], peers[n_fit:]
+    if target.path in {peer.path for peer in peers}:
+        raise ValueError("Target exposure must not appear among its dither peers")
+    if not (len(peers) == len(peer_exclusions) == len(peer_sources)):
+        raise ValueError("Peer list and peer mask lists have different lengths")
+    if len(peers) < MIN_DITHER_SCENE_PEERS:
+        raise ValueError("Dither 1/f requires at least one other exposure")
+    if diagnostics and len(peers) > 1:
+        n_fit = max(1, len(peers) - MAX_HELDOUT)
+        fit_peers, heldout = peers[:n_fit], peers[n_fit:]
+        fit_exclusions, heldout_exclusions = peer_exclusions[:n_fit], peer_exclusions[n_fit:]
+        fit_sources, heldout_sources = peer_sources[:n_fit], peer_sources[n_fit:]
+    else:
+        fit_peers, heldout = peers, []
+        fit_exclusions, heldout_exclusions = peer_exclusions, []
+        fit_sources, heldout_sources = peer_sources, []
     try:
-        stack = np.stack([_aligned(p, target, good) for p in fit_peers])
+        ny, nx = target.science.shape
+        scene_stack = np.full((len(fit_peers), ny, nx), np.nan, dtype=np.float32)
+        peer_diagnostics = []
+        scene_names = []
+        n_scene = 0
+        for peer, exclusion, sources in zip(fit_peers, fit_exclusions, fit_sources):
+            try:
+                aligned, coverage, alignment, stats = _aligned(
+                    peer, target, good, exclusion, sources, target_sources)
+            except (ValueError, FloatingPointError) as exc:
+                peer_diagnostics.append({"peer": peer.path.name, "role": "scene",
+                                         "used": False, "reason": str(exc)})
+                continue
+            scene_stack[n_scene] = aligned
+            n_scene += 1
+            scene_names.append(peer.path.name)
+            peer_diagnostics.append({"peer": peer.path.name, "role": "scene",
+                                     "used": True, "coverage": stats,
+                                     "source_alignment": alignment})
+            del aligned, coverage
+        if n_scene == 0:
+            raise ValueError("No overlapping peers remain for the dither scene")
+        scene_stack = scene_stack[:n_scene]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            scene = np.nanmedian(stack, axis=0, overwrite_input=True)
-        del stack
+            clipped_scene = SigmaClip(sigma=3.0, maxiters=5)(
+                scene_stack, axis=0, masked=True, copy=False)
+            scene = np.ma.median(clipped_scene, axis=0).filled(np.nan).astype(np.float32)
+        del clipped_scene, scene_stack
         model, meta = fit_stripes(target.science, scene, good)
         del scene
         corrected = target.science - model
         checks = []
-        for peer in heldout:
-            aligned = _aligned(peer, target, good)
+        for peer, exclusion, sources in zip(heldout, heldout_exclusions, heldout_sources):
+            try:
+                aligned, coverage, alignment, stats = _aligned(
+                    peer, target, good, exclusion, sources, target_sources)
+            except (ValueError, FloatingPointError) as exc:
+                peer_diagnostics.append({"peer": peer.path.name, "role": "heldout",
+                                         "used": False, "reason": str(exc)})
+                continue
             checks.append({"peer": peer.path.name,
                            "row_before": _row_rms(target.science - aligned, good),
                            "row_after": _row_rms(corrected - aligned, good),
                            "tile_before": _tile_rms(target.science - aligned, good),
-                           "tile_after": _tile_rms(corrected - aligned, good)})
+                           "tile_after": _tile_rms(corrected - aligned, good),
+                           "source_alignment": alignment,
+                           "coverage": stats})
+            peer_diagnostics.append({"peer": peer.path.name, "role": "heldout",
+                                     "used": False, "coverage": stats,
+                                     "source_alignment": alignment})
+            del aligned, coverage
     except (ValueError, FloatingPointError) as exc:
         raise ValueError(f"Dither 1/f fit failed for {target.path.name}: {exc}") from exc
-    mean = {k: float(np.mean([c[k] for c in checks]))
-            for k in ("row_before", "row_after", "tile_before", "tile_after")}
-    accepted = (mean["row_after"] < 0.95 * mean["row_before"] and
-                mean["tile_after"] < 0.95 * mean["tile_before"] and
-                all(c["row_after"] < 1.05 * c["row_before"] and
-                    c["tile_after"] < 1.05 * c["tile_before"] for c in checks))
-    return model, {"scene_dithers": [p.path.name for p in fit_peers], **meta,
-                   "qc_accepted": bool(accepted), **mean, "heldout": checks}
+    qc_accepted = None
+    mean = {}
+    if checks:
+        mean = {k: float(np.mean([c[k] for c in checks]))
+                for k in ("row_before", "row_after", "tile_before", "tile_after")}
+        qc_accepted = (mean["row_after"] < 0.95 * mean["row_before"] and
+                       mean["tile_after"] < 0.95 * mean["tile_before"] and
+                       all(c["row_after"] < 1.05 * c["row_before"] and
+                           c["tile_after"] < 1.05 * c["tile_before"] for c in checks))
+    return model, {"scene_dithers": scene_names, **meta,
+                   "peer_reprojection": peer_diagnostics,
+                   "qc_accepted": qc_accepted,
+                   "diagnostics_enabled": diagnostics,
+                   "diagnostic_only": True, **mean, "heldout": checks}
 
 
 def _scan_1f_xy(image: np.ndarray, invalid: np.ndarray,
@@ -277,8 +465,9 @@ def _scan_1f_xy(image: np.ndarray, invalid: np.ndarray,
     Estimate column profiles in row blocks and row profiles across the full
     width. Keep their centered 40th-percentile structure after removing a
     501-pixel running-median trend, matching the Jumprope keep_trend=True
-    configuration. The upper 10% of unmasked values are excluded from the
-    estimates. Masked science pixels are not changed by this model.
+    configuration. No segmentation/source mask is applied; the upper 10% of
+    valid values are still clipped regardless of whether they belong to
+    sources. Masked science pixels are not changed by this model.
     """
     original = np.asarray(image, dtype=np.float32)
     bad = np.asarray(invalid, dtype=bool) | ~np.isfinite(original) | (original == 0)

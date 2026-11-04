@@ -3,18 +3,24 @@
 This file applies to the standalone `stage2plus` repository. Read
 [README.md](README.md) for supported CLI use, [CONTEXT.md](CONTEXT.md) for the
 scientific decision history, and [DEVELOPMENT.md](DEVELOPMENT.md) for the
-2026-11-03 SKYSURFIR pilot findings and remaining validation goals. The
-single-frame fallback is now implemented in the local v2.1 worktree but has
-not yet had a science pilot. The upstream
-repository is `ralphy1017/stage2plus` on `main`.
+2026-11-03 SKYSURFIR pilot findings and remaining validation goals. Upstream
+`main` is at v2.1 commit `98f3b52`; local uncommitted v2.5 changes implement a
+PHANGS-inspired multi-exposure row fit with full-WCS registration and
+background matching. The default 20-exposure mini-run selected dither for all
+targets; its products and figures are under
+`/data5/rzi/jp/stage2plus-phangs-v25-mini-20261103/`. This is execution
+evidence, not science validation. See the mini-test reports and this
+worktree's status before using or publishing it. The upstream repository is
+`ralphy1017/stage2plus` on `main`.
 
 ## Identify the code and run before acting
 
 - Check `git status`, the current commit, and the input/output paths first.
-  The pushed v2.0 baseline is commit `bcc1514`. The local worktree now also
-  contains uncommitted v2.1 fallback changes; the earlier user-added
-  `--no-onef-object-mask` option is preserved. Do not assume a clean clone of
-  upstream `main` has either change until it is pushed.
+  Upstream `main` commit `98f3b52` contains the v2.1 fallback. The working
+  tree includes local, uncommitted v2.2-v2.5 changes.
+  `--no-onef-object-mask` controls source masking for the dither fit; the scan
+  fallback is always source-unmasked. Do not assume a clean clone of upstream
+  `main` has these local changes until they are pushed.
 - `stage2plus.py` owns CLI validation, FITS-header grouping, long-wave then
   short-wave scheduling, product assembly, metadata, and summary writing.
   `steps.py` owns masks, WCS projection, registered-dither and single-frame
@@ -43,25 +49,34 @@ repository is `ralphy1017/stage2plus` on `main`.
    Keep PRIMARY, ERR, DQ, AREA, VAR_POISSON, VAR_RNOISE, VAR_FLAT, and ASDF
    data in both outputs, replacing only SCI and adding provenance
    cards/history. Preserve FITS checksums.
-4. Select exactly one 1/f model per exposure. Use the dither model only if
-   its held-out QC passes. On too few dithers, dither fit error, or failed
-   dither QC, discard that candidate and use the masked Jumprope-style scan
-   fallback (`keep_trend=True`). Never subtract both. `DITH1F` says whether
-   the dither method was selected; `DITHQC` records its QC when measurable;
-   `ONEFAPPL` records model application; `ONEFSTAT=REVIEW` marks the fallback
-   because it has no independent held-out peer QC. If both methods fail, the
+4. Apply every computable dither 1/f model, even when optional held-out QC
+   fails. `DITHQC` records that diagnostic separately; it does not select the
+   method. Use the Jumprope-style scan fallback (`keep_trend=True`) only when
+   no peer overlaps or the dither scene/row model cannot be computed. The
+   v2.5 dither method uses all overlapping peers by default, source-based
+   translation correction over the full WCS, scalar background matching, a
+   sigma-clipped median scene, and sigma-clipped per-amplifier row medians.
+   The former 0.1-pixel source residual and 5% held-out RMS rules are optional
+   diagnostics, not acceptance gates. `--dither-diagnostics` withholds peers
+   and changes the fitted scene; it is for validation, not default processing.
+   The fallback excludes detector-invalid
+   pixels but does not mask sources or wisps; its 90th-percentile value clip
+   remains. `DITH1F` and `ONEFAPPL` both record that a 1/f correction was
+   applied; `ONEFMETH` identifies `DITHER` or `SELF`. A dither model without a
+   passing optional QC is marked `ONEFSTAT=REVIEW`. If both methods fail, the
    group must report an error rather than write an uncorrected product.
 5. Group by FITS `PROGRAM`, `OBSERVTN`, `VISIT`, `VISITGRP`, `SEQ_ID`,
    `ACT_ID`, detector, filter, and pupil; require at least one exposure.
-   Dither fitting needs four group exposures; smaller groups use the scan
-   fallback. Run long-wave groups first so matched masks can be projected to
-   short-wave frames. If no paired long-wave exposure exists, document that the
+   Dither fitting needs one overlapping peer (two group exposures); a group
+   with one exposure uses the scan fallback. Run long-wave groups first so
+   matched masks can be projected to short-wave frames. If no paired long-wave
+   exposure exists, document that the
    short-wave mask used only its own segmentation. Do not mix different
    upstream calibration versions or duplicate basenames in one manifest.
 6. The default object threshold is 2.8σ with at least five connected pixels;
-   mask growth is capped at 32 pixels. Protect bright wisp regions in 1/f
-   fits while retaining at least 64 usable pixels per amplifier row. The sky
-   mask also excludes NMF wisp support grown by eight pixels. `Background2D`
+   mask growth is capped at 32 pixels. Neither 1/f method excludes the bright
+   wisp region by mask. The sky mask still excludes NMF wisp support grown by
+   eight pixels. `Background2D`
    uses 256-pixel boxes, a 3×3 filter, biweight location, `SigmaClip()`, and
    `exclude_percentile=50`. The photutils default of 10 failed the tested
    grown-mask fields; change these settings only with a clear test.
@@ -90,9 +105,10 @@ repository is `ralphy1017/stage2plus` on `main`.
   `completed` counts and an empty `errors` list. Count files in `cal/`,
   `cal_sky_renorm/`, and `models/`, and count figures unless `--no-figures`
   was selected. Inspect representative figures across detectors, filters,
-  dither QC failures, and scan fallbacks. For `DITHQC=False`, check that
-  `ONEFMETH=SELF`, `ONEFAPPL=True`, and `ONEFSTAT=REVIEW` agree. If dither QC
-  was unavailable, it is null in JSON and omitted from the SCI header.
+  dither fits, optional QC failures, and scan fallbacks. For `DITHQC=False`,
+  check that `ONEFMETH=DITHER`, `ONEFAPPL=True`, and `ONEFSTAT=REVIEW` agree;
+  the computed dither model remains applied. With optional diagnostics off,
+  DITHQC is null in JSON and omitted from the SCI header.
   A group that fails after writing some exposures can leave partial products
   outside `summary.json`; reconcile or isolate them before retrying.
 - Verify SCI headers (`S2PVER`, `STGORDER`, `ONEFMETH`, `ONEFSTAT`,
