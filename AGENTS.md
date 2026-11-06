@@ -3,15 +3,15 @@
 This file applies to the standalone `stage2plus` repository. Read
 [README.md](README.md) for supported CLI use, [CONTEXT.md](CONTEXT.md) for the
 scientific decision history, and [DEVELOPMENT.md](DEVELOPMENT.md) for the
-2026-11-03 SKYSURFIR pilot findings and remaining validation goals. v2.7
-combines the single-frame
-`keep_trend=True` scan with an amplifier-local 2D low-k fit; dither-first is
-still opt-in via `--onef-mode auto`. The three-frame test figures are at
-`diagnostics/amp-scene-decomposition-20261105/`. The test used existing
-production outputs read-only and did not modify the active production run.
-The user reviewed the figures and requested publishing the candidate to
-`ralphy1017/stage2plus` `main`; this review does not constitute broad science
-validation or a production rerun.
+2026-11-06 SKYSURFIR pilot findings and remaining validation goals. The local
+v2.10 candidate keeps object masks out of the keep-trend scan, uses an initial
+Photutils mask plus a 512-pixel coarse background and 2.0σ/3-pixel residual
+segmentation to capture faint outskirts, then fits amplifier-local surfaces
+and a detector-wide y-only polynomial in one 1/f model. The five-frame test
+outputs are under `diagnostics/object-mask-v210-five-20261106/`; the original
+production outputs were not modified. Wisp stays after 1/f. `cal/` subtracts only 1/f and wisp;
+`cal_sky_renorm/` also gets median, `Background2D`, and pedestal subtraction.
+This candidate has not been validated broadly.
 
 The earlier v2.6 20-exposure rerun is at
 `/data5/rzi/jp/stage2plus-fallback-default-mini-20261103/`; the user reviewed
@@ -21,9 +21,10 @@ summary and this worktree's status before acting.
 ## Identify the code and run before acting
 
 - Check `git status`, the current commit, and the input/output paths first.
-  The local v2.7 default is the source-unmasked scan plus amplifier-local 2D
-  fit; `--onef-mode auto` opts into the v2.5 dither-first workflow. The
-  three-frame test is not a production rerun or broad science validation.
+  The local v2.10 default is the source-unmasked scan plus object-masked
+  amplifier and detector-wide low-k fits; `--onef-mode auto` opts into the
+  dither-first workflow. The five-frame test is not a production rerun or
+  broad science validation.
   `--no-onef-object-mask` controls source masking for the dither fit only.
 - `stage2plus.py` owns CLI validation, FITS-header grouping, long-wave then
   short-wave scheduling, product assembly, metadata, and summary writing.
@@ -38,29 +39,35 @@ summary and this worktree's status before acting.
 
 ## Preserve the science contract
 
-1. Keep the current order: Photutils source mask, selected dither-or-scan 1/f,
-   object-masked median sky, `Background2D` residual sky, NMF wisp where a
-   template exists, then masked scalar pedestal. The sky fits are performed
-   before the wisp fit. The local v2.7 candidate adds only the per-frame
-   amplifier-local 2D low-k term described below; do not add a separate
-   background subtraction pass. PHANGS pjpipe destriping was tried and
-   dropped at the user's request.
-2. Write both products from the **same** 1/f, wisp, and pedestal models:
-   `cal_sky_renorm/` subtracts both sky models; `cal/` retains them. Do not
-   apply additional sky subtraction to `cal/`. Do not use sky-subtracted SCI
-   to estimate absolute sky surface brightness. Retaining the sky in `cal/`
-   is not proof that all diffuse sky modes are unbiased.
+1. Keep the current order: Photutils source segmentation and grown masks;
+   selected dither or the source-unmasked scan plus masked low-k fits;
+   object-masked median sky; `Background2D` residual sky; NMF wisp where a
+   template exists; then masked scalar pedestal. The sky fits are performed
+   before the wisp fit. The low-k maps are part of the one per-frame 1/f
+   model, not a separate sky subtraction pass. PHANGS pjpipe destriping was
+   tried and dropped at the user's request.
+2. Keep the output branches scientifically distinct. `cal/` subtracts only
+   the selected 1/f model (including its masked amplifier-local and
+   detector-wide low-k terms) and the wisp template. Do not subtract its
+   median, `Background2D`, or pedestal; object-free regions in this product
+   are used for absolute sky measurements. `cal_sky_renorm/` additionally
+   subtracts the object-masked median, `Background2D` residual, and final
+   pedestal to produce a near-zero masked background. Do not use its SCI to
+   measure absolute sky brightness.
 3. Use `SCI_ORIG` when present, otherwise input `SCI`. Never alter input FITS.
    Keep PRIMARY, ERR, DQ, AREA, VAR_POISSON, VAR_RNOISE, VAR_FLAT, and ASDF
    data in both outputs, replacing only SCI and adding provenance
    cards/history. Preserve FITS checksums.
-4. The local v2.7 default `--onef-mode fallback` fits the Jumprope-style
-   single-frame scan (`keep_trend=True`) with per-amplifier 2D surfaces from
-   the same frame. A full-detector cubic surface is kept as shared low-k
-   structure; each amplifier's quadratic surface minus that shared surface
-   joins the scan in one combined model. Only detector-invalid pixels are
-   excluded, no object mask or dither peers are used, and the global median is
-   preserved. `--onef-mode auto` opts into
+4. The local v2.10 default `--onef-mode fallback` fits the Jumprope-style
+   single-frame scan (`keep_trend=True`) using detector-invalid pixels only.
+   It then fits robust 128-pixel tile medians outside the grown source mask
+   plus four additional dilation pixels. A full-frame cubic surface is kept
+   as shared low-k structure; each amplifier's quadratic surface minus that
+   shared surface is a local correction. A degree-2 polynomial in detector
+   y, constant across x, models broad horizontal structure. Apply the fitted
+   low-k surfaces under source pixels and subtract the scan and both surfaces
+   once as one model. `LOWKMASK`, `LOWKOBJ`, and `LOWKDIL` record the mask and
+   settings. `--onef-mode auto` opts into
    dither fitting; it applies every computable dither model even when optional
    held-out QC fails, and uses the scan only when the dither scene/row model
    cannot be computed. `DITHQC` records optional diagnostics separately; it
@@ -125,13 +132,14 @@ summary and this worktree's status before acting.
   A group that fails after writing some exposures can leave partial products
   outside `summary.json`; reconcile or isolate them before retrying.
 - Verify SCI headers (`S2PVER`, `STGORDER`, `ONEFMETH`, `ONEFSTAT`,
-  `ONEFAPPL`, `ONEFVER`, `DITH1F`, `DITHQC`, `SKYSUB`, `SKYMED`, `BKG2D`
-  where applicable, `WISPMETH`, `PEDESTAL`), FITS
+  `ONEFAPPL`, `ONEFVER`, `LOWKOBJ`, `LOWKDIL`, `DITH1F`, `DITHQC`, `SKYSUB`, `SKYMED`, `BKG2D`
+  where applicable, `SEGNSIG`, `SEGNPIX`, `SEGBKG`, `WISPMETH`, `PEDESTAL`), FITS
   checksums, and preserved non-SCI arrays on representative outputs. Check
-  arithmetic closure against `models/`: skyless SCI should match input minus
-  `ONEF`, `SKYMED`, `SKYBKG`, optional `WISP`, and `PEDESTAL` to float32
-  precision; `cal/SCI` should match input minus `ONEF`, optional `WISP`, and
-  `PEDESTAL`. The final masked skyless median should be near zero.
+  arithmetic closure against `models/`: `cal_sky_renorm/SCI` should match
+  input minus `ONEF`, `SKYMED`, `SKYBKG`, optional `WISP`, and `PEDESTAL` to
+  float32 precision; `cal/SCI` should match input minus `ONEF` and optional
+  `WISP`. Check that the skyless masked median is near zero. `cal/` must not
+  be forced to any renormalized median.
 - Do not infer full-database reliability from the 16-exposure v2 pilot. A
   100k-frame campaign needs staged storage/throughput tests, sharded input
   manifests, failure recovery, and sky-signal injection checks. The current

@@ -27,12 +27,20 @@ def plot_steps(path: Path, title: str, panels: list[tuple[str, np.ndarray | None
                invalid: np.ndarray, sky: float, noise: float) -> None:
     """Draw panels of (label, array, kind) on shared stretches.
 
-    kind is "sky" (sky retained, centred on the sky level), "skyless"
-    (centred on zero), "model" (diverging, own symmetric scale) or "mask".
+    kind is "sky" (sky retained, displayed relative to the measured median),
+    "skyless" (centred on zero), "absolute" (raw MJy/sr values on a shared
+    pair stretch), "model" (diverging) or "mask".
     """
     noise = max(noise, 1e-4)
-    ncols = (len(panels) + 1) // 2
-    fig, axes = plt.subplots(2, ncols, figsize=(4 * ncols, 8.6), constrained_layout=True)
+    absolute_norm = AsinhNorm(
+        linear_width=noise,
+        vmin=min(-3 * noise, sky - 3 * noise),
+        vmax=max(25 * noise, sky + 25 * noise))
+    ncols = min(5, len(panels))
+    nrows = (len(panels) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(4 * ncols, 4.3 * nrows),
+                             squeeze=False, constrained_layout=True)
     for ax in axes.flat:
         ax.set_axis_off()
     for ax, (label, array, kind) in zip(axes.flat, panels):
@@ -45,16 +53,29 @@ def plot_steps(path: Path, title: str, panels: list[tuple[str, np.ndarray | None
             ax.imshow(array[::BIN, ::BIN], origin="lower", cmap="gray_r",
                       vmin=0, vmax=2, interpolation="nearest")
             continue
-        if kind == "model":
-            scale = max(float(np.nanpercentile(np.abs(array[::8, ::8]), 99.5)), 0.1 * noise)
+        if kind in ("model", "model_binned"):
+            model_image = (array if kind == "model_binned"
+                           else _binned(array, invalid))
+            scale = max(float(np.nanpercentile(np.abs(model_image), 99.5)), 0.1 * noise)
             norm, cmap = plt.Normalize(-scale, scale), "coolwarm"
         else:
             # AsinhNorm is linear around zero, so display relative to the sky.
             if kind == "sky":
                 array = array - np.float32(sky)
-            norm = AsinhNorm(linear_width=noise, vmin=-3 * noise, vmax=25 * noise)
+            norm = (absolute_norm if kind == "absolute" else
+                    AsinhNorm(linear_width=noise, vmin=-3 * noise,
+                              vmax=25 * noise))
             cmap = "gray"
-        image = ax.imshow(_binned(array, invalid), origin="lower", cmap=cmap,
+            model_image = _binned(array, invalid)
+            if kind == "absolute":
+                # Final cal and cal_sky_renorm share this exact absolute
+                # stretch; do not subtract SKYMED from cal for display.
+                ax.text(0.02, 0.02, "shared absolute stretch",
+                        transform=ax.transAxes, fontsize=7, color="yellow",
+                        ha="left", va="bottom")
+                fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
+                             shrink=0.7, label="MJy/sr")
+        image = ax.imshow(model_image, origin="lower", cmap=cmap,
                           norm=norm, interpolation="nearest")
         if kind == "model":
             fig.colorbar(image, ax=ax, shrink=0.7, label="MJy/sr")

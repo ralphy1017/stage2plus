@@ -1,6 +1,6 @@
 # stage2plus: project context and validation record
 
-Updated 2026-11-03. This document explains why the current reducer has its
+Updated 2026-11-06. This document explains why the current reducer has its
 particular order and what has actually been tested. Use [README.md](README.md)
 for installation and CLI examples; use [AGENTS.md](AGENTS.md) for operational
 rules when changing or running the code.
@@ -19,16 +19,18 @@ The v2 pipeline has two outputs for each input:
 
 | Output | SCI content | Intended use |
 | --- | --- | --- |
-| `cal/` | input − selected 1/f − NMF wisp − final scalar pedestal | Exposure with the measured sky retained for sky analysis. |
-| `cal_sky_renorm/` | `cal/` − object-masked median sky − `Background2D` residual sky | Sky-subtracted drizzle input. |
+| `cal/` | input − selected 1/f − NMF wisp | Exposure for absolute sky measurements; no median-sky, `Background2D`, or pedestal subtraction. |
+| `cal_sky_renorm/` | input − selected 1/f − object-masked median sky − `Background2D` residual − NMF wisp − final scalar pedestal | Sky-subtracted drizzle input with near-zero masked background. |
 
-The same 1/f, wisp, and scalar pedestal models are used in both products. The
-wisp fit is measured on the temporarily sky-subtracted image. “Renormalization”
-here means subtracting the final **additive** object-masked median pedestal;
-it does not multiply or photometrically rescale the science image. Do not infer
-absolute sky surface brightness from `cal_sky_renorm/SCI`. `cal/` retains a
-sky level, but the current tests do not prove unbiased recovery of every
-diffuse sky mode or separation of astronomical sky from instrumental offsets.
+`cal/` receives only the 1/f and wisp models; it does not receive the median,
+`Background2D`, or pedestal subtraction, so object-free regions remain usable
+for measuring the true sky. The wisp fit is measured on the temporarily
+sky-subtracted image, but only its fitted template is subtracted from `cal/`.
+“Renormalization” in `cal_sky_renorm/` means additive median and pedestal
+corrections, not multiplication or photometric rescaling. Do not infer
+absolute sky surface brightness from `cal_sky_renorm/SCI`. Tests do not prove
+that the 1/f model cleanly separates detector artifacts from every true
+diffuse astronomical component.
 
 ## How the method evolved
 
@@ -124,7 +126,25 @@ diffuse sky mode or separation of astronomical sky from instrumental offsets.
    256-pixel-smoothed image relative to the current products, not validation
    scores. No production FITS files were modified.
 
-## Current v2.7 candidate mode and recorded products
+9. **v2.8 source-masked low-k fit and detector-row polynomial (local).** The
+   user reported that the v2.7 amplifier fit removed real galaxy flux in
+   source-rich amplifier regions. The keep-trend scan remains unmasked for
+   striping. Only the amplifier-local surface and a detector-wide quadratic
+   polynomial in y use the grown Photutils object mask, plus four extra
+   dilation pixels. The shared cubic across the four amplifiers remains a
+   protected reference; local quadratic departures and the y-only polynomial
+   are added to the scan and subtracted as one 1/f model. The y polynomial is
+   constant across x, so it fits horizontal structure without rotating. The
+   five requested raw Stage 2 exposures completed in four groups with zero
+   errors. Results and figures are in
+   `diagnostics/masked-lowk-y-poly-mini-20261106/`; full mini-run products are
+   under `/tmp/stage2plus-lowk-masked-mini-20261106/`. The active production
+   directories were not changed. Residual amp-median ranges improved in four
+   frames and were nearly unchanged in one; row-profile variation improved
+   in all five. These are execution and background diagnostics, not source
+   flux or diffuse-light validation.
+
+## Current v2.10 candidate mode and recorded products
 
 `steps.read_exposure` reads `SCI_ORIG` when present, otherwise `SCI`, and
 identifies unusable pixels from DO_NOT_USE DQ (grown one pixel), nonfinite or
@@ -135,18 +155,23 @@ must be unique. A group needs at least one exposure. The default single-frame
 scan does not require a dither peer. `--onef-mode auto` attempts dither fitting
 when another group exposure is available and uses every overlapping peer.
 
-1. **Object and fit masks.** Photutils detects sources with at least five
-   connected pixels at 2.8 times an ERR-based threshold over the image
-   median. The matched
-   long-wave mask is projected by WCS onto short-wave exposures when present.
+1. **Object and fit masks.** Photutils first segments clear sources at 2.8σ
+   with a 5-pixel minimum area. It masks that seed and its existing grown
+   version while estimating a 512-pixel coarse `Background2D`, then segments
+   the residual at 2.0σ with a 3-pixel minimum area and unions those faint
+   detections with the seed. The matched long-wave mask is projected by WCS
+   onto short-wave exposures when present.
    Each connected object is grown by its equivalent radius, capped at 32
    pixels. Bad pixels and grown sources are excluded from the optional auto
-   dither fit. The scan and amplifier-local fit exclude only detector-invalid
-   pixels by mask; source and bright-wisp pixels participate, subject to the
-   scan's 90th-percentile clip and robust tile medians. No bright-wisp region
-   mask is applied in either 1/f mode. The sky mask still excludes invalid
-   pixels, grown objects, and the NMF wisp support grown by eight pixels
-   during later sky estimation.
+   dither fit. In the default scan path, detector-invalid pixels alone are
+   excluded from `keep_trend=True`; sources and wisps participate in its
+   profiles subject to the 90th-percentile value clip. For low-k fits only,
+   grow the object mask by four more pixels and exclude it along with bad
+   pixels while measuring tile and row-band medians. Evaluate the fitted
+   surfaces across masked source pixels so the detector background correction
+   remains continuous under objects. No bright-wisp region mask is applied.
+   The sky mask still excludes invalid pixels, grown objects, and the NMF
+   wisp support grown by eight pixels during later sky estimation.
 2. **Optional PHANGS-inspired dither 1/f.** In `--onef-mode auto`, full-WCS
    reprojection maps each
    peer onto the target detector grid with fractional valid-coverage handling.
@@ -173,24 +198,30 @@ when another group exposure is available and uses every overlapping peer.
    90th percentile, so the highest source pixels can be excluded by value. It
    measures 40th-percentile row/column profiles, scans in 512-row blocks, and
    keeps the centered profiles after subtracting a 501-pixel running-median
-   trend. On the scan residual, tile medians at 128-pixel spacing fit a robust
-   cubic surface across all four amplifiers and a quadratic 2D surface within
-   each amplifier. The local correction is the amplifier surface minus the
-   shared surface, so shared smooth structure remains in SCI. The shared
-   surface is a fit reference only; it is never subtracted. The local term is
-   combined with the scan into one `ONEF` map, then median-recentered so the
-   global SCI median is unchanged. It is implemented locally in `steps.py`
-   and uses no object mask or dither peer. `ONEFOBJ=False` records that no
-   source mask was used. The fit has no independent held-out QC and is marked
-   `ONEFSTAT=REVIEW`.
-4. **Sky and wisps.** The masked median is subtracted first. A
+   trend. On the scan residual, robust 128-pixel tile medians outside the
+   dilated object mask fit a cubic surface across all four amplifiers and a
+   quadratic 2D surface within each amplifier. The shared surface is only a
+   reference; subtract the per-amplifier local-minus-shared difference, not
+   the shared sky-like component. Then fit a robust degree-2 polynomial in
+   detector y to 64-row-band medians across all amplifiers. This y-only map is
+   constant across x and models broad horizontal structure without rotating.
+   Both low-k components are recentered on the unmasked background and added
+   to the scan in one `ONEF` map. They are evaluated under source pixels but
+   fitted only outside the object mask. `ONEFOBJ=False`, `LOWKOBJ=True`, and
+   `LOWKDIL=4` distinguish scan masking from low-k fit masking. The method is
+   local to `steps.py`, has no dither peers, and has no independent held-out
+   QC; it is marked `ONEFSTAT=REVIEW`.
+4. **Sky and wisps.** This sequence applies to `cal_sky_renorm/` only. The
+   `cal/` branch stops after subtracting the selected 1/f and fitted wisp
+   models so absolute sky measurements remain available. In the sky-subtracted
+   branch, the masked median is subtracted first. A
    `Background2D` residual model uses 256-pixel boxes, a 3×3 filter,
    `BiweightLocationBackground`, `SigmaClip()`, and 50% box exclusion by
    default. On detector/filter combinations with a bundled basis, the fixed
    NMF components are fitted by ERR-weighted nonnegative least squares after
    measuring an off-wisp baseline. The last masked median is the pedestal.
-5. **Outputs.** `models/<basename>.fits` contains `OBJMASK`, `SKYMASK`,
-   `ONEF`, `SKYBKG`, and `WISP` when fitted; its primary header stores
+5. **Outputs.** `models/<basename>.fits` contains `OBJMASK`, `LOWKMASK`,
+   `SKYMASK`, `ONEF`, `SKYBKG`, and `WISP` when fitted; its primary header stores
    `SKYMED` and `PEDESTAL`. `figures/<stem>_steps.png` shows input, masks,
    models, intermediate frames, and both final products. `summary.json`
    records per-exposure values and any group errors. Both output FITS copy
@@ -205,8 +236,8 @@ is recorded as `ONEFMETH=SELF`, `DITH1F=True`, `ONEFAPPL=True`, and
 even if QC fails or was not run; `ONEFAPPL` records subtraction and `DITH1F`
 records that some 1/f correction was applied. If auto dither fitting cannot
 be computed, a successful scan is selected as `ONEFMETH=SELF`.
-`S2PVER`, `ONEFMETH`, `ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `DITH1F`, `DITHQC`,
-`DITHN`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` distinguish
+`S2PVER`, `ONEFMETH`, `ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `LOWKOBJ`, `LOWKDIL`,
+`DITH1F`, `DITHQC`, `DITHN`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH`, and `PEDESTAL` distinguish
 method and product provenance.
 
 ## What was run and verified
@@ -221,6 +252,9 @@ method and product provenance.
 | `/data5/rzi/jp/stage2plus-phangs-v25-diag-mini-20261103/` | Separate optional `--dither-diagnostics --no-figures` run on the same 20 exposures | 14 dither models computed (5 passed, 9 failed the custom held-out 5% RMS check); 6 scan fallbacks occurred because withholding peers left an unusable reduced scene. These results do not gate the default all-peer fit. |
 | `/data5/rzi/jp/stage2plus-fallback-default-mini-20261103/` | v2.6 default scan mode, same 20 exposures, four leased CPUs | 20/20 each of `cal/`, `cal_sky_renorm/`, `models/`, and step figures; 20/20 `SELF` scan models applied; zero dither attempts and group errors. Output FITS checksums passed; 280 non-SCI HDUs matched input arrays; `cal/` model arithmetic closed exactly and masked sky medians were within 4.6e-13 MJy/sr of zero. User reviewed the figures and requested publishing the default change; execution checks do not establish science quality. |
 | `diagnostics/amp-scene-decomposition-20261105/` | Local v2.7 per-frame candidate on the three named examples from `/data4/rzi/skysurfir/stage2plus/skysurfir-combined-v1/production-20261105-v1/` | Median sky preserved to printed precision on all three; inter-amplifier residual medians moved toward the shared surface. Fractional 256-pixel-smoothed image change versus current products: 48.1%, 25.8%, and 1.8%. Figures are for manual review; this is not a production run or source-flux validation. |
+| `diagnostics/masked-lowk-y-poly-mini-20261106/` | Local v2.8 on the five exposures named in the 2026-11-06 user request; single-frame fallback; one worker | 5/5 completed in four groups, zero errors. Comparing old and new `cal/` with the same v2.8 fit mask, the centered four-amplifier median range improved in four frames (0.00425→0.00358, 0.00375→0.00387, 0.00051→0.00004, 0.08351→0.05379, 0.00149→0.00058 MJy/sr). The robust scatter of 64-row background medians decreased in all five (0.00173→0.00139, 0.00453→0.00339, 0.00027→0.00025, 0.25326→0.14003, 0.00248→0.00224 MJy/sr). These are residual-background diagnostics, not source-flux or diffuse-light validation. FITS outputs are in `/tmp/stage2plus-lowk-masked-mini-20261106/`; production outputs were untouched. |
+| `diagnostics/flat-background-mini-20261106/` | Local v2.9 on the same five examples; single-frame fallback; one worker | 5/5 completed in four groups, zero errors. `cal/` subtracts only 1/f and wisp; its masked median exactly matches the post-1/f sky median. `cal_sky_renorm/` additionally subtracts median, `Background2D`, and pedestal; its masked median is zero. Both branches closed exactly against saved model arrays on valid pixels. Final pairs use the same absolute display stretch. Outputs are in `/tmp/stage2plus-flat-background-mini-20261106/`; production outputs were untouched. |
+| `diagnostics/object-mask-v210-five-20261106/` | Local v2.10 on the same five examples; revised faint-outskirt segmentation; original 1/f-then-wisp order; one worker | 5/5 completed in four groups, zero errors. The 2.8σ/5-pixel seed is extended with 2.0σ/3-pixel residual detections after a seed-masked 512-pixel coarse background. `cal/` subtracts only 1/f+wisp and retains its measured masked sky median; `cal_sky_renorm/` additionally subtracts masked median, `Background2D`, wisp, and pedestal, yielding masked median zero. Both branches close exactly against saved model arrays on valid pixels. The paired final-product sheet uses the same absolute stretch within each exposure pair. Outputs are in `/tmp/stage2plus-objectmask-v210-five-20261106/`; production outputs were untouched. This execution and visual check is not a diffuse-source injection or broad science validation. The wisp-before-1/f experiment was rejected. |
 
 These paths are records on the development machine, **not** data shipped in
 the Git repository. The v1 input manifest is
@@ -254,12 +288,13 @@ with zero dither attempts, zero group errors, and 20 `SELF` models applied.
   long-wave mask. The current v2 code does not require a basis for every
   wisp-sensitive input; absent bases lead to `WISPMETH=NONE`. Review coverage
   before a full database run.
-- The v2.7 local amplifier-surface candidate was run only on the three
-  specified frames. Its global cubic reference may not capture every
-  non-polynomial galaxy or intracluster-light profile, and the per-region
-  component can therefore still overlap astrophysical flux. Review the three
-  figures and run source/diffuse-light injections before using it on a full
-  database. The existing production products were not changed.
+- The v2.8 masked amplifier-surface and y-polynomial candidate was run only on
+  the five specified frames. Object masks reduce contamination, but any
+  unmasked diffuse galaxy or cluster light can still bias a low-k fit, and
+  applying the fitted maps under source masks can affect extended-source
+  flux. Review all five figures and run source/diffuse-light injections
+  before using it on a full database. The existing production products were
+  not changed.
 - In optional auto mode, a dither scene needs enough common sky after full-WCS peer reprojection.
   Sparse overlap or heavily masked amplifier rows can still make the fit
   impossible and invoke the scan backup. Source-match residuals are recorded

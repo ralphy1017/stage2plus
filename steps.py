@@ -25,13 +25,21 @@ from scipy.spatial import cKDTree
 KEEP_HDUS = ("PRIMARY", "SCI", "ERR", "DQ", "AREA", "VAR_POISSON",
              "VAR_RNOISE", "VAR_FLAT", "ASDF")
 
-SEGMENT_NSIGMA = 2.8
+SEGMENT_NSIGMA = 2.0
+SEGMENT_MIN_PIXELS = 3
+SEGMENT_BACKGROUND_BOX = (512, 512)
+SEGMENT_BACKGROUND_EXCLUDE_PERCENTILE = 50.0
+SEGMENT_INITIAL_NSIGMA = 2.8
+SEGMENT_INITIAL_MIN_PIXELS = 5
 MASK_GROWTH_CAP = 32       # pixels
 WISP_SUPPORT_GROWTH = 8    # pixels excluded around the wisp template support
 MAX_HELDOUT = 2            # dithers withheld from each 1/f scene for QC
 MIN_DITHER_SCENE_PEERS = 1
 SCAN_BLOCK_ROWS = 512
 SCAN_TREND_BLOCK = 501
+LOWK_MASK_DILATION = 4
+GLOBAL_Y_POLY_DEGREE = 2
+GLOBAL_Y_BIN_ROWS = 64
 REPROJECT_ROWS = 128
 REPROJECT_VALID_COVERAGE = 1.0 - 1e-6
 SOURCE_MATCH_RADIUS_PIXELS = 5.0
@@ -84,20 +92,53 @@ def robust_sigma(values: np.ndarray) -> float:
 # Object masks ---------------------------------------------------------------
 
 def segment(exp: Exposure, nsigma: float = SEGMENT_NSIGMA) -> np.ndarray:
-    """Photutils segmentation footprint above nsigma * ERR over the median."""
+    """Photutils source mask from a coarse, first-pass-masked background.
+
+    A conservative first pass protects obvious sources while estimating a
+    coarse background. A lower-threshold segmentation on its residual then
+    extends the source footprint into faint outskirts; the existing mask
+    growth is applied by the caller and is not increased here.
+    """
     valid = ~exp.invalid
     if valid.sum() < 1000:
         return np.zeros(exp.science.shape, bool)
     sample = exp.science[valid][::max(1, int(valid.sum() // 250_000))]
+    level = float(np.median(sample))
     sigma = robust_sigma(sample)
     if not np.isfinite(sigma) or sigma <= 0:
         sigma = float(np.median(exp.err[valid]))
-    threshold = np.maximum(exp.err, max(0.5 * sigma, 1e-12)) * nsigma + np.median(sample)
+    initial_threshold = (np.maximum(exp.err, max(0.5 * sigma, 1e-12)) *
+                        SEGMENT_INITIAL_NSIGMA + level)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        # Minimum of 5 pixels, passed positionally (renamed in photutils 3).
-        seg = detect_sources(exp.science, threshold, 5, connectivity=8, mask=exp.invalid)
-    return np.zeros(exp.science.shape, bool) if seg is None else seg.data != 0
+        # Minimum area is positional for compatibility with photutils 2/3.
+        initial_seg = detect_sources(exp.science, initial_threshold,
+                                     SEGMENT_INITIAL_MIN_PIXELS,
+                                     connectivity=8, mask=exp.invalid)
+    initial = (np.zeros(exp.science.shape, bool) if initial_seg is None
+               else initial_seg.data != 0)
+    initial_grown = grow_mask(initial)
+    background_mask = exp.invalid | initial_grown
+    centered = exp.science - np.float32(level)
+    coarse = Background2D(
+        np.where(background_mask, 0, centered),
+        box_size=SEGMENT_BACKGROUND_BOX, mask=background_mask,
+        filter_size=BKG_FILTER, sigma_clip=SigmaClip(sigma=3.0, maxiters=5),
+        bkg_estimator=BiweightLocationBackground(),
+        exclude_percentile=SEGMENT_BACKGROUND_EXCLUDE_PERCENTILE)
+    residual = centered - np.asarray(coarse.background, dtype=np.float32)
+    residual_good = valid & ~initial_grown & np.isfinite(residual)
+    residual_sigma = robust_sigma(residual[residual_good])
+    if not np.isfinite(residual_sigma) or residual_sigma <= 0:
+        residual_sigma = float(np.median(exp.err[valid]))
+    threshold = np.maximum(exp.err, max(0.5 * residual_sigma, 1e-12)) * nsigma
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        faint_seg = detect_sources(residual, threshold, SEGMENT_MIN_PIXELS,
+                                   connectivity=8, mask=exp.invalid)
+    faint = (np.zeros(exp.science.shape, bool) if faint_seg is None
+             else faint_seg.data != 0)
+    return initial | faint
 
 
 @lru_cache(maxsize=32)
@@ -613,7 +654,8 @@ def _tile_medians(image: np.ndarray, good: np.ndarray, tile: int
             np.asarray(amplifiers, dtype=np.int8))
 
 
-def fit_amp_local_lowk(image: np.ndarray, invalid: np.ndarray, *,
+def fit_amp_local_lowk(image: np.ndarray, invalid: np.ndarray,
+                       object_mask: np.ndarray | None = None, *,
                        tile: int = 128, global_degree: int = 3,
                        local_degree: int = 2) -> tuple[np.ndarray, dict]:
     """Fit only 2D low-k structure localized to one of four amplifiers.
@@ -623,11 +665,15 @@ def fit_amp_local_lowk(image: np.ndarray, invalid: np.ndarray, *,
     local surface minus the shared surface, so structure that continues
     smoothly across the detector is retained while amplifier-confined
     curvature or offsets become a correction. Tile medians suppress compact
-    sources; only detector-invalid pixels are excluded.
+    sources, and the supplied source mask is excluded with detector-invalid
+    pixels while fitting.
     """
     image = np.asarray(image, dtype=np.float32)
     invalid = np.asarray(invalid, dtype=bool)
-    good = ~invalid & np.isfinite(image) & (image != 0)
+    object_mask = (np.zeros(image.shape, dtype=bool) if object_mask is None
+                   else np.asarray(object_mask, dtype=bool))
+    valid = ~invalid & np.isfinite(image) & (image != 0)
+    good = valid & ~object_mask
     ny, nx = image.shape
     if nx % 4:
         raise ValueError("Amplifier-local fit requires four equal-width regions")
@@ -659,14 +705,15 @@ def fit_amp_local_lowk(image: np.ndarray, invalid: np.ndarray, *,
             "local_model_rms": float(np.sqrt(np.mean(
                 local[:, x0:x1][good[:, x0:x1]].astype(np.float64) ** 2)))}
 
-    # The low-k component is differential by construction; remove its global
-    # median so this step cannot change the exposure's absolute sky pedestal.
-    local[~good] = 0.0
+    # Fit only on unmasked background pixels, but apply the smooth correction
+    # under sources too. This removes the detector component without clipping
+    # or fitting through galaxy light.
+    local[~valid] = 0.0
     local -= np.float32(np.median(local[good]))
     median_before = float(np.median(image[good]))
     median_after = float(np.median((image - local)[good]))
     local += np.float32(median_after - median_before)
-    local[~good] = 0.0
+    local[~valid] = 0.0
     return local, {"algorithm": "AMP_LOCAL_2D_MINUS_SHARED_SURFACE",
                    "tile_px": tile, "global_degree": global_degree,
                    "local_degree": local_degree,
@@ -681,28 +728,112 @@ def fit_amp_local_lowk(image: np.ndarray, invalid: np.ndarray, *,
                    "global_median_after": float(np.median((image - local)[good]))}
 
 
-def scan_onef_joint(image: np.ndarray, invalid: np.ndarray
-                    ) -> tuple[np.ndarray, dict]:
-    """Jointly model keep-trend 1/f and amplifier-confined 2D low-k residuals.
+def fit_global_y_polynomial(image: np.ndarray, invalid: np.ndarray,
+                            object_mask: np.ndarray | None = None, *,
+                            degree: int = GLOBAL_Y_POLY_DEGREE,
+                            bin_rows: int = GLOBAL_Y_BIN_ROWS
+                            ) -> tuple[np.ndarray, dict]:
+    """Fit an axis-aligned, detector-wide horizontal background component.
 
-    The components are estimated on the same frame and returned as one model
-    for one subtraction. The shared full-detector low-k surface is a protected
-    reference; only the four amplifier-local residual surfaces are subtracted.
+    Robust row-band medians use unmasked sky samples across all four
+    amplifiers. The resulting polynomial depends only on detector y, so its
+    contours stay horizontal and cannot rotate to follow a galaxy or source
+    pattern. The fitted map is applied across the full detector, including
+    masked source pixels.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    invalid = np.asarray(invalid, dtype=bool)
+    object_mask = (np.zeros(image.shape, dtype=bool) if object_mask is None
+                   else np.asarray(object_mask, dtype=bool))
+    ny, nx = image.shape
+    valid = ~invalid & np.isfinite(image) & (image != 0)
+    good = valid & ~object_mask
+    centers, medians = [], []
+    for y0 in range(0, ny, bin_rows):
+        y1 = min(ny, y0 + bin_rows)
+        region_good = good[y0:y1]
+        if region_good.mean() < 0.12:
+            continue
+        values = image[y0:y1][region_good]
+        centers.append((y0 + y1 - 1) / 2.0)
+        medians.append(float(np.median(values)))
+    if len(centers) < degree + 6:
+        raise ValueError("Too few unmasked row bands for detector-wide y polynomial")
+
+    ycoord = 2.0 * np.asarray(centers) / max(ny - 1, 1) - 1.0
+    z = np.asarray(medians)
+    design = np.column_stack([ycoord ** power for power in range(degree + 1)])
+    keep = np.isfinite(z)
+    min_points = degree + 4
+    for _ in range(6):
+        coef = np.linalg.lstsq(design[keep], z[keep], rcond=None)[0]
+        residual = z - design @ coef
+        center = float(np.median(residual[keep]))
+        sigma = robust_sigma(residual[keep])
+        if not np.isfinite(sigma) or sigma <= 1e-12:
+            break
+        updated = np.isfinite(residual) & (np.abs(residual - center) <= 3.5 * sigma)
+        if updated.sum() < min_points or np.array_equal(updated, keep):
+            break
+        keep = updated
+    coef = np.linalg.lstsq(design[keep], z[keep], rcond=None)[0]
+    yfull = 2.0 * np.arange(ny, dtype=np.float32) / max(ny - 1, 1) - 1.0
+    ydesign = np.column_stack([yfull ** power for power in range(degree + 1)])
+    profile = np.asarray(ydesign @ coef, dtype=np.float32)
+    model = np.broadcast_to(profile[:, None], (ny, nx)).copy()
+    model[~valid] = 0.0
+    model -= np.float32(np.median(model[good]))
+    model[~valid] = 0.0
+    return model, {"degree_y": degree, "bin_rows": bin_rows,
+                   "row_bands": int(len(centers)), "used_bands": int(keep.sum()),
+                   "fit_rms": float(np.sqrt(np.mean((z[keep] - design[keep] @ coef) ** 2))),
+                   "model_rms": float(np.sqrt(np.mean(model[good].astype(np.float64) ** 2))),
+                   "object_mask_fraction": float(object_mask.mean()),
+                   "fit_fraction": float(good.mean())}
+
+
+def scan_onef_joint(image: np.ndarray, invalid: np.ndarray,
+                    object_mask: np.ndarray | None = None, *,
+                    return_components: bool = False):
+    """Combine an unmasked scan with masked local and horizontal low-k fits.
+
+    The keep-trend row/column scan uses detector-invalid pixels only. Source
+    pixels are excluded only while measuring the amplifier-local and global-y
+    surfaces; those smooth fits are still evaluated under masked sources. All
+    components are returned as one map and subtracted once.
     """
     data = np.asarray(image, dtype=np.float32)
     scan_model, scan_stats = scan_onef(data, invalid)
-    amp_model, amp_stats = fit_amp_local_lowk(data - scan_model, invalid)
-    model = scan_model + amp_model
+    protected = (np.zeros(data.shape, dtype=bool) if object_mask is None
+                 else np.asarray(object_mask, dtype=bool))
+    amp_model, amp_stats = fit_amp_local_lowk(
+        data - scan_model, invalid, protected)
+    after_amp = data - scan_model - amp_model
+    y_model, y_stats = fit_global_y_polynomial(after_amp, invalid, protected)
+    model = scan_model + amp_model + y_model
     bad = np.asarray(invalid, dtype=bool) | ~np.isfinite(data) | (data == 0)
     model[bad] = 0.0
-    return model, {"algorithm": "PROFOUND_SCAN_KEEP_TREND_PLUS_AMP_LOCAL_2D",
-                   "keep_trend": True,
+    stats = {"algorithm": "SCAN_KEEP_TREND_PLUS_MASKED_AMP_2D_AND_GLOBAL_Y_POLY",
+                   "keep_trend": True, "scan_fit_mask": "INVALID ONLY",
+                   "lowk_fit_mask": "INVALID + GROWN OBJECT MASK + 4PX DILATION",
                    "scan_model_rms": scan_stats["model_rms"],
                    "scan": scan_stats, "amp_lowk": amp_stats,
+                   "global_y_lowk": y_stats,
                    "model_rms": float(np.sqrt(np.mean(
                        model[~bad].astype(np.float64) ** 2))),
                    "fit_fraction": min(scan_stats["fit_fraction"],
-                                       amp_stats["fit_fraction"])}
+                                       amp_stats["fit_fraction"],
+                                       y_stats["fit_fraction"])}
+    if return_components:
+        ny, nx = data.shape
+        if ny % 4 or nx % 4:
+            raise ValueError("Component figures require dimensions divisible by four")
+        def display_bin(component):
+            return component.reshape(ny // 4, 4, nx // 4, 4).mean(axis=(1, 3))
+        return model, stats, {"scan": display_bin(scan_model),
+                              "amp_local": display_bin(amp_model),
+                              "global_y": display_bin(y_model)}
+    return model, stats
 
 
 # Sky, wisp and pedestal -----------------------------------------------------

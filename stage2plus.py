@@ -2,16 +2,16 @@
 """Stage 2 plus: clean JWST NIRCam dither groups before drizzling.
 
 For each exposure in a dither group (same visit, detector, filter and pupil)
-it writes two products from the input science. By default it uses the
-single-frame keep-trend scan correction. The optional auto mode first tries a
-registered-dither model using all overlapping peers, then uses the scan only
-when that fit cannot be computed:
+it writes two products from the input science. By default it fits an
+unmasked single-frame keep-trend scan plus object-masked amplifier-local and
+detector-wide y-only low-k components. The optional auto mode first tries a
+registered-dither model using all overlapping peers, then uses the per-frame
+fit only when that fit cannot be computed:
 
   cal_sky_renorm/  photutils object mask -> registered-dither 1/f -> masked
                    median sky -> Background2D residual sky -> NMF wisp (where
                    a template exists) -> masked pedestal renormalisation
-  cal/             the same corrections without the median and Background2D
-                   sky, so the measured sky is retained
+  cal/             input - 1/f - NMF wisp; original sky/background retained
 
 Models and masks go to models/, one step-by-step figure per exposure to
 figures/, and per-exposure measurements to summary.json. Long-wave groups run
@@ -44,7 +44,7 @@ from scipy import ndimage as ndi
 import steps
 from figures import plot_steps
 
-VERSION = "2.7"
+VERSION = "2.10"
 MIN_DITHERS = 1
 DITHER_MIN_DITHERS = 2
 DETECTOR_PATTERN = re.compile(r"^NRC[AB](?:[1-4]|LONG)$")
@@ -64,32 +64,46 @@ def group_label(info: dict) -> str:
                      info["filter"], info["pupil"])).lower()
 
 
-def _scan_onef(exp: steps.Exposure, fallback_bad: np.ndarray, *,
+def _scan_onef(exp: steps.Exposure, fallback_bad: np.ndarray,
+               lowk_object_mask: np.ndarray, *,
+               capture_components: bool,
                dither_attempted: bool, dither_error: str | None,
                selection_reason: str) -> tuple[np.ndarray, dict]:
-    """Fit and record the scan plus per-amplifier 2D low-k correction."""
-    model, scan_meta = steps.scan_onef_joint(exp.science, fallback_bad)
+    """Fit an unmasked scan plus source-masked low-k components."""
+    result = steps.scan_onef_joint(exp.science, fallback_bad, lowk_object_mask,
+                                   return_components=capture_components)
+    if capture_components:
+        model, scan_meta, components = result
+    else:
+        model, scan_meta = result
+        components = None
     return model, {"method": "SELF", "status": "REVIEW", "applied": True,
                    "object_mask": False,
-                   "fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
+                   "fit_mask": "SCAN: INVALID ONLY; LOW-K: INVALID+GROWN OBJECTS+DILATED 4PX",
+                   "lowk_object_mask": True,
                    "qc_accepted": None,
                    "dither_attempted": dither_attempted,
                    "dither_error": dither_error,
                    "fallback_attempted": True,
                    "fallback_reason": selection_reason,
                    "fallback": scan_meta,
+                   "_components": components,
                    "model_rms": scan_meta["model_rms"],
                    "fit_fraction": scan_meta["fit_fraction"]}
 
 
 def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray,
-             fallback_bad: np.ndarray, dither_object_mask: bool,
+             fallback_bad: np.ndarray, lowk_object_mask: np.ndarray,
+             dither_object_mask: bool,
+             capture_components: bool,
              peer_exclusions: list[np.ndarray], target_sources: np.ndarray,
              peer_sources: list[np.ndarray], dither_diagnostics: bool,
              onef_mode: str) -> tuple[np.ndarray, dict]:
     """Select the scan by default; optionally try dither first in auto mode."""
     if onef_mode == "fallback":
-        return _scan_onef(exp, fallback_bad, dither_attempted=False,
+        return _scan_onef(exp, fallback_bad, lowk_object_mask,
+                          capture_components=capture_components,
+                          dither_attempted=False,
                           dither_error=None,
                           selection_reason="selected by default fallback mode")
 
@@ -113,7 +127,9 @@ def fit_onef(exp: steps.Exposure, peers: list[steps.Exposure], good: np.ndarray,
     # Do not keep the rejected full-frame candidate alive while allocating the
     # scan model; large groups can otherwise have a high peak RSS here.
     del dither_model
-    return _scan_onef(exp, fallback_bad, dither_attempted=True,
+    return _scan_onef(exp, fallback_bad, lowk_object_mask,
+                      capture_components=capture_components,
+                      dither_attempted=True,
                       dither_error=dither_error,
                       selection_reason=dither_error or "dither model unavailable")
 
@@ -126,7 +142,7 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
     basis = steps.load_basis(template, exposures[0].science.shape) if template else None
 
     # 1. Object masks: own segmentation plus the matching long-wave mask.
-    objects, grown, onef_masks, fallback_bad_masks = [], [], [], []
+    objects, grown, onef_masks, fallback_bad_masks, lowk_masks = [], [], [], [], []
     for exp in exposures:
         mask = steps.segment(exp)
         lw_models = cfg["lw_models"].get(exp.path.name)
@@ -140,6 +156,8 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
         fallback_bad = exp.invalid.copy()
         onef_masks.append(onef)
         fallback_bad_masks.append(fallback_bad)
+        lowk_masks.append(ndi.binary_dilation(
+            grown[-1], iterations=steps.LOWK_MASK_DILATION))
 
     records = []
     support = (ndi.binary_dilation(basis[1], iterations=steps.WISP_SUPPORT_GROWTH)
@@ -150,10 +168,13 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
         peers = [exposures[j] for j in peer_indices]
         onef, onef_meta = fit_onef(
             exp, peers, ~onef_masks[i], fallback_bad_masks[i],
+            lowk_masks[i],
             cfg["onef_object_mask"],
+            cfg["figures"],
             [onef_masks[j] for j in peer_indices], objects[i],
             [objects[j] for j in peer_indices], cfg["dither_diagnostics"],
             cfg["onef_mode"])
+        onef_components = onef_meta.pop("_components", None)
         after_onef = exp.science - onef
         sky_mask = exp.invalid | grown[i] | ~np.isfinite(after_onef)
         if support is not None:
@@ -174,12 +195,11 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                                              *basis, template)
         after_wisp = no_background - wisp if wisp is not None else no_background
 
-        # 6. Pedestal: rezero the masked median; cal keeps the measured sky.
+        # 6. Pedestal is applied only to the sky-subtracted branch. Keep cal
+        # free of median/background/pedestal adjustments for sky measurement.
         pedestal = steps.masked_median(after_wisp, sky_good)
         final_sky = after_wisp - np.float32(pedestal)
-        final_cal = after_onef - np.float32(pedestal)
-        if wisp is not None:
-            final_cal -= wisp
+        final_cal = after_onef - wisp if wisp is not None else after_onef
 
         name = exp.path.name
         cards = {"S2PVER": (VERSION, "stage2plus version"),
@@ -187,13 +207,24 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                  "ONEFSTAT": (onef_meta["status"], "selected method QC status"),
                  "ONEFAPPL": (onef_meta["applied"], "1/f model subtracted"),
                  "ONEFVER": ("DITH-PH25" if onef_meta["method"] == "DITHER"
-                             else "SCAN-KT3", "selected 1/f implementation"),
+                             else "SCAN-KT4", "selected 1/f implementation"),
                  "DITH1F": (onef_meta["applied"], "1/f correction applied"),
                  "ONEFOBJ": (onef_meta["object_mask"],
                              "objects masked in selected 1/f fit"),
+                 "LOWKOBJ": (bool(onef_meta.get("lowk_object_mask", False)),
+                             "objects masked while fitting low-k terms"),
+                 "LOWKDIL": (steps.LOWK_MASK_DILATION
+                             if onef_meta.get("lowk_object_mask", False) else 0,
+                             "extra low-k object mask dilation (pixels)"),
+                 "SEGNSIG": (steps.SEGMENT_NSIGMA,
+                             "faint-outskirt detection threshold sigma"),
+                 "SEGNPIX": (steps.SEGMENT_MIN_PIXELS,
+                             "minimum faint-segment connected pixels"),
+                 "SEGBKG": (steps.SEGMENT_BACKGROUND_BOX[0],
+                            "coarse segmentation background box pixels"),
                  "SKYMED": (sky_median, "masked median sky (MJy/sr)"),
                  "WISPMETH": ("NMF" if wisp is not None else "NONE", "wisp model"),
-                 "PEDESTAL": (pedestal, "post-wisp masked median removed (MJy/sr)")}
+                 "PEDESTAL": (pedestal, "skyless branch only (MJy/sr)")}
         if onef_meta["qc_accepted"] is not None:
             cards["DITHQC"] = (onef_meta["qc_accepted"],
                                "held-out dither 1/f check passed")
@@ -206,10 +237,11 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                                 "BKG2D": (True, "Background2D residual sky removed")},
                          history="SCI = input - 1/f - median sky - Background2D - wisp - pedestal")
         steps.write_fits(exp, out / "cal" / name, final_cal,
-                         cards={**cards, "STGORDER": ("MASK-1F-WISP-PED", "steps"),
+                         cards={**cards, "STGORDER": ("MASK-1F-WISP", "steps"),
                                 "SKYSUB": (False, "sky retained")},
-                         history="SCI = input - 1/f - wisp - pedestal (sky retained)")
-        write_models(exp, out / "models" / name, objects[i], sky_mask, onef,
+                         history="SCI = input - 1/f - wisp; sky, Background2D, and pedestal retained")
+        write_models(exp, out / "models" / name, objects[i], lowk_masks[i],
+                     sky_mask, onef,
                      background, wisp, sky_median, pedestal, onef_meta)
 
         noise = steps.robust_sigma(final_sky[sky_good][::40])
@@ -218,18 +250,24 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                        f"{name} | {detector} {band} | 1/f {onef_meta['method']} "
                        f"({onef_meta['status']})",
                        [("Input SCI", exp.science, "sky"),
-                        (("Source mask shown (not used by SELF); sky mask (grey)"
+                        (("Mask for low-k fits (scan stays unmasked); sky mask"
                           if onef_meta["method"] == "SELF" else
                           "Object mask (black), sky mask (grey)"),
-                         sky_mask.astype(np.uint8) + objects[i], "mask"),
+                         sky_mask.astype(np.uint8) + lowk_masks[i], "mask"),
+                        ("Keep-trend scan model",
+                         None if onef_components is None else onef_components["scan"], "model_binned"),
+                        ("Masked amplifier-local low-k model",
+                         None if onef_components is None else onef_components["amp_local"], "model_binned"),
+                        ("Masked detector-wide y polynomial",
+                         None if onef_components is None else onef_components["global_y"], "model_binned"),
                         (f"{onef_meta['method']} 1/f model", onef, "model"),
                         ("After 1/f", after_onef, "sky"),
                         (f"After median sky ({sky_median:.4f})", skyless, "skyless"),
                         ("Background2D model", background, "model"),
                         ("After Background2D", no_background, "skyless"),
                         ("NMF wisp model", wisp, "model"),
-                        (f"Final cal_sky_renorm (pedestal {pedestal:+.2e})", final_sky, "skyless"),
-                        ("Final cal (sky retained)", final_cal, "sky")],
+                        (f"Final cal_sky_renorm (pedestal {pedestal:+.2e})", final_sky, "absolute"),
+                        ("Final cal (sky retained; 1/f+wisp only)", final_cal, "absolute")],
                        exp.invalid, sky_median, noise)
 
         records.append({"input": str(exp.path), "file": name, "group": label,
@@ -242,10 +280,12 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                         "wisp": wisp_meta, "pedestal": pedestal,
                         "final_masked_median": float(np.median(final_sky[sky_good])),
                         "noise": noise})
+        if onef_components is not None:
+            del onef_components
     return {"group": label, "records": records}
 
 
-def write_models(exp, path: Path, objects, sky_mask, onef, background, wisp,
+def write_models(exp, path: Path, objects, lowk_mask, sky_mask, onef, background, wisp,
                  sky_median: float, pedestal: float, onef_meta: dict) -> None:
     primary = fits.PrimaryHDU()
     primary.header["SKYMED"] = (sky_median, "masked median sky (MJy/sr)")
@@ -254,14 +294,26 @@ def write_models(exp, path: Path, objects, sky_mask, onef, background, wisp,
     primary.header["ONEFSTAT"] = (onef_meta["status"], "selected method QC status")
     primary.header["ONEFAPPL"] = (onef_meta["applied"], "1/f model subtracted")
     primary.header["ONEFVER"] = ("DITH-PH25" if onef_meta["method"] == "DITHER"
-                                  else "SCAN-KT3", "selected 1/f implementation")
+                                  else "SCAN-KT4", "selected 1/f implementation")
     primary.header["ONEFOBJ"] = (onef_meta["object_mask"],
                                   "objects masked in selected 1/f fit")
+    primary.header["LOWKOBJ"] = (bool(onef_meta.get("lowk_object_mask", False)),
+                                  "objects masked while fitting low-k terms")
+    primary.header["LOWKDIL"] = (steps.LOWK_MASK_DILATION
+                                  if onef_meta.get("lowk_object_mask", False) else 0,
+                                  "extra low-k object mask dilation (pixels)")
+    primary.header["SEGNSIG"] = (steps.SEGMENT_NSIGMA,
+                                  "faint-outskirt detection threshold sigma")
+    primary.header["SEGNPIX"] = (steps.SEGMENT_MIN_PIXELS,
+                                  "minimum faint-segment connected pixels")
+    primary.header["SEGBKG"] = (steps.SEGMENT_BACKGROUND_BOX[0],
+                                 "coarse segmentation background box pixels")
     primary.header["DITH1F"] = (onef_meta["applied"], "1/f correction applied")
     if onef_meta["qc_accepted"] is not None:
         primary.header["DITHQC"] = (onef_meta["qc_accepted"], "dither QC passed")
     hdus = [primary,
             fits.ImageHDU(objects.astype(np.uint8), exp.sci_header, name="OBJMASK"),
+            fits.ImageHDU(lowk_mask.astype(np.uint8), exp.sci_header, name="LOWKMASK"),
             fits.ImageHDU(sky_mask.astype(np.uint8), exp.sci_header, name="SKYMASK"),
             fits.ImageHDU(onef.astype(np.float32), exp.sci_header, name="ONEF"),
             fits.ImageHDU(background.astype(np.float32), exp.sci_header, name="SKYBKG")]
@@ -318,13 +370,13 @@ def main() -> int:
                         help="Background2D exclude_percentile: skip boxes with more than "
                              "this percent masked (default 50; photutils default 10)")
     parser.add_argument("--no-onef-object-mask", action="store_true",
-                        help="disable source masking for registered-dither fits; the scan fallback is always source-unmasked")
+                        help="disable source masking for registered-dither fits; scan profiles stay unmasked and their low-k fits stay masked")
     parser.add_argument("--dither-diagnostics", action="store_true",
                         help="hold out up to two peers for optional RMS diagnostics; diagnostics never gate model use")
     parser.add_argument("--onef-mode", choices=("fallback", "auto"),
                         default="fallback",
-                        help="fallback (default): use keep_trend scan plus per-amplifier 2D low-k fit; "
-                             "auto: try registered dithers and scan only if fitting fails")
+                        help="fallback (default): unmasked keep_trend scan plus masked amplifier and detector-y low-k fits; "
+                             "auto: try registered dithers and use the per-frame fit only if fitting fails")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
@@ -407,25 +459,29 @@ def main() -> int:
                      key=lambda r: r["file"])
     summary = {"stage2plus": VERSION,
                "method": (
-                   ("object mask -> Jumprope-style single-frame scan plus "
-                    "amplifier-local 2D low-k fit (default); "
+                   ("unmasked Jumprope-style scan plus object-masked "
+                    "amplifier-local 2D and detector-wide y-polynomial fits (default); "
                     "PHANGS-style multi-exposure dither is opt-in"
                     if args.onef_mode == "fallback" else
                     "object mask -> PHANGS-style multi-exposure dither 1/f "
                     "or Jumprope-style scan fallback")
-                   + " -> masked median sky -> Background2D -> NMF wisp -> "
-                     "pedestal; cal/ omits both sky steps"),
+                   + " -> NMF wisp; cal/ applies only 1/f+wisp, while "
+                     "cal_sky_renorm/ also subtracts masked median, Background2D, and pedestal"),
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
                             "dither_min_dithers": DITHER_MIN_DITHERS,
                             "onef_mode": args.onef_mode.upper(),
-                            "fallback_method": "PROFOUND_SCAN_KEEP_TREND_PLUS_AMP_LOCAL_2D",
+                            "fallback_method": "SCAN_KEEP_TREND_PLUS_MASKED_AMP_2D_AND_GLOBAL_Y_POLY",
                             "dither_diagnostics": cfg["dither_diagnostics"],
                             "onef_object_mask": cfg["onef_object_mask"],
                             "fallback_object_mask": False,
+                            "fallback_lowk_object_mask": True,
+                            "lowk_mask_growth_cap_px": steps.MASK_GROWTH_CAP,
+                            "lowk_mask_dilation_px": steps.LOWK_MASK_DILATION,
+                            "global_y_poly_degree": steps.GLOBAL_Y_POLY_DEGREE,
                             "dither_fit_mask": ("INVALID+SOURCE; WISP INCLUDED"
                                                 if cfg["onef_object_mask"]
                                                 else "INVALID ONLY; SOURCES+WISP INCLUDED"),
-                            "fallback_fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
+                            "fallback_fit_mask": "SCAN INVALID ONLY; LOW-K INVALID+GROWN SOURCE MASK+DILATED 4PX",
                             "dither_wisp_mask": False,
                             "fallback_wisp_mask": False,
                             "dither_reprojection": "full WCS plus matched-source translation",
@@ -435,7 +491,13 @@ def main() -> int:
                             "source_alignment_tolerance_px": steps.SOURCE_ALIGNMENT_TOL_PIXELS,
                             "source_match_radius_px": steps.SOURCE_MATCH_RADIUS_PIXELS,
                             "min_source_alignment_matches": steps.MIN_SOURCE_ALIGNMENT_MATCHES,
+                            "segment_method": "INITIAL_MASKED_BG512_RESIDUAL_SEGMENT",
                             "segment_nsigma": steps.SEGMENT_NSIGMA,
+                            "segment_min_pixels": steps.SEGMENT_MIN_PIXELS,
+                            "segment_background_box_px": steps.SEGMENT_BACKGROUND_BOX[0],
+                            "segment_background_exclude_percentile": steps.SEGMENT_BACKGROUND_EXCLUDE_PERCENTILE,
+                            "segment_initial_nsigma": steps.SEGMENT_INITIAL_NSIGMA,
+                            "segment_initial_min_pixels": steps.SEGMENT_INITIAL_MIN_PIXELS,
                             "mask_growth_cap": steps.MASK_GROWTH_CAP,
                             "wisp_support_growth": steps.WISP_SUPPORT_GROWTH,
                             "max_heldout": steps.MAX_HELDOUT,

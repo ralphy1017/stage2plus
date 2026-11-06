@@ -3,30 +3,36 @@
 **Audience:** future agents developing the standalone Stage2Plus reducer and
 its SKYSURFIR integration.
 
-**Status:** v2.7 combines the single-frame Jumprope-style `keep_trend=True`
-scan with an amplifier-local 2D low-k fit; registered dither remains opt-in
-via `--onef-mode auto`. The user requested per-frame decomposition: preserve
-smooth low-k structure shared across amplifier regions, subtract low-k
-structure localized within a region, and estimate both terms as one combined
-1/f model. The three-frame test figures are at
-`diagnostics/amp-scene-decomposition-20261105/`; the user reviewed the figures
-and requested publishing this version. Active production outputs were not
-changed, and this three-frame review is not broad science validation.
+**Status:** Local v2.10 keeps the Jumprope-style `keep_trend=True` scan
+unmasked, then fits amplifier-local 2D surfaces and a detector-wide y-only
+polynomial outside a dilated Photutils object mask. `cal/` subtracts only this
+1/f model and the wisp model, preserving the measured sky and its spatial
+structure. `cal_sky_renorm/` additionally subtracts the masked median,
+`Background2D`, and pedestal. Its final panels use one shared absolute stretch
+for `cal/` and `cal_sky_renorm/`; the remaining sky is allowed to look
+different. The revised five-frame mini-test is in
+`diagnostics/object-mask-v210-five-20261106/`. The object mask now starts with
+a 2.8σ/5-pixel seed, estimates a 512-pixel coarse background, then adds
+2.0σ/3-pixel detections from that residual. The wisp remains after the full
+1/f fit. Production outputs were not changed; this candidate is not broadly
+science-validated.
 
 ## User goal
 
-The user's current instruction keeps the method per frame and fits the
-`keep_trend=True` scan together with the shared and amplifier-local 2D
-components. The registered-dither method remains available as opt-in
-`--onef-mode auto`. Keep the sky-retaining `cal/` and sky-subtracted
-`cal_sky_renorm/` branches consistent with the selected correction model.
+The user's current instruction keeps the method per frame: do not source-mask
+the `keep_trend=True` scan; use a slightly dilated object mask only when
+measuring amplifier-local and detector-wide horizontal low-k components.
+Subtract these components together in one 1/f step. The registered-dither
+method remains opt-in via `--onef-mode auto`. Keep the sky-retaining `cal/`
+and sky-subtracted `cal_sky_renorm/` branches consistent with the selected
+correction model.
 
 The long-term scope is all selected science imaging, including groups with
 fewer than four dithers. Instrument-specific adapters and validation are
 required: current Stage2Plus supports NIRCam imaging, and its NIRCam masks,
 templates, and thresholds must not be applied blindly to NIRISS or MIRI. The
-current local candidate is the joint single-frame fit following the user's
-review of v2.6 residuals. Unsupported or failed exposures must receive an
+current local candidate is the v2.10 masked-low-k single-frame fit following
+the user's review of v2.7 residuals. Unsupported or failed exposures must receive an
 explicit hold or failure status, never silently pass through as corrected.
 
 This brief does not authorize a production database run. It describes the
@@ -180,6 +186,25 @@ median was preserved on all three; the 256-pixel-smoothed image changed by
 surface model itself need visual review; source-flux and diffuse-light
 injection tests have not been run.
 
+The local v2.8 candidate addresses five further examples:
+`jw01063001004_02101_00002_nrcb4`,
+`jw01063001004_02101_00003_nrcb4`,
+`jw01063002002_02101_00009_nrcblong`,
+`jw01074004001_02101_00003_nrcb4`, and
+`jw01176211001_03103_00002_nrcblong`. It read the original Stage 2 inputs
+from `/data3/rzi/skysurfir/w200-v1/nircam/stage2/cal/` and wrote a mini-run to
+`/tmp/stage2plus-lowk-masked-mini-20261106/`. All five completed in four
+groups with zero errors. The scan model is still fit from invalid-pixel-only
+profiles. Low-k surfaces use robust 128-pixel tile medians outside the grown
+object mask plus four extra dilation pixels; the fits are evaluated under
+source pixels. A quadratic polynomial in detector y, fitted to 64-row medians
+pooled across the four amplifiers, models horizontal structure with no x
+dependence. With the same new mask measuring old and new `cal/`, centered
+amplifier-median range decreased in four of five frames; the 64-row
+background-median robust scatter decreased in all five. These diagnostics do
+not prove source-flux or diffuse-light preservation; no injection study was
+run.
+
 The plan found matching NMF WISP bases in 31 of 78 groups; 47 groups (212
 exposures) had no basis. This is a separate correction-coverage gap from 1/f.
 
@@ -190,8 +215,9 @@ pilot did not run Image3 or perform a complete source-flux injection study.
 
 ## Current default mode and optional dither mode
 
-The current local candidate is the single-frame scan plus the amplifier-local
-2D term. The dither workflow described below is opt-in through
+The current local candidate is the single-frame unmasked scan plus
+object-masked amplifier-local and detector-wide y-only low-k fits. The dither
+workflow described below is opt-in through
 `--onef-mode auto`; the user selected per-frame modeling after reviewing
 residuals in the dither-default figures.
 
@@ -214,14 +240,43 @@ per-exposure outcome. Do not require a complete four-dither group to attempt
    use it to measure transfer to held-out peers, not as the default.
 3. **Default per-exposure joint fit.** The scan follows the invalid-pixel-only,
    source-unmasked NEP/JumproPe `scan_1f(..., keep_trend=True)` behavior
-   referenced by [`../stage2-plus.py`](../stage2-plus.py). A shared cubic
-   surface across all four amplifiers is retained; each amplifier's quadratic
-   2D fit minus that shared surface is combined with the scan into one model.
-   The global median is preserved and the combined model is subtracted once.
+   referenced by [`../stage2-plus.py`](../stage2-plus.py). For low-k fitting,
+   use robust tile medians outside the grown source mask plus four pixels.
+   Retain the shared cubic surface; add the amplifier-local quadratic minus
+   that shared surface, and a detector-wide quadratic in y that is constant
+   across x. Evaluate the low-k terms under the objects and subtract their sum
+   with the scan once. Preserve the background median. The five-frame test is
+   execution/background evidence only; validate source flux and diffuse-sky
+   recovery before production deployment.
    In `auto` mode this fit is selected when no usable peer exists or dither
    fitting raises. A failed optional held-out diagnostic does not discard a
    computed dither model. Validate source flux and diffuse-sky recovery before
    treating the local candidate as production-ready.
+
+## Sky-preserving output semantics (v2.10 local)
+
+`cal/` is the product for absolute sky measurements. It subtracts the selected
+1/f map (the scan plus masked low-k amplifier and detector-y components) and
+the fitted wisp template, with no median-sky, `Background2D`, or pedestal
+subtraction. `cal_sky_renorm/` subtracts the object-masked median,
+`Background2D` residual, and final pedestal as well. The two final figure
+panels are displayed with the same absolute MJy/sr stretch; the sky-bearing
+`cal/` image is not recentered for display.
+
+The five requested exposures were rerun from their original `/data3` inputs
+to `/tmp/stage2plus-objectmask-v210-five-20261106/`. All 5/5 completed in four
+groups with zero errors using the revised mask: a 2.8σ/5-pixel seed, a
+seed-masked 512-pixel coarse background, then 2.0σ/3-pixel detections on the
+background residual. The accepted order remains 1/f, median sky,
+`Background2D`, wisp, then pedestal in the sky-subtracted branch; `cal/`
+subtracts only 1/f and wisp. The `cal/` masked median matched the measured
+post-1/f sky median in all five, and `cal_sky_renorm/` masked medians were
+zero. Both branches closed exactly against saved models on valid pixels.
+Figures, summary, and audit are in
+`diagnostics/object-mask-v210-five-20261106/`; final pairs use identical
+absolute stretches within each exposure. The experiment moving wisp ahead of
+the low-k fit was not adopted. No source-flux injection test has been run;
+production outputs remain untouched.
 4. **Use a hybrid model only when its parts are explicit.** If the dither fit
    is supported in some amplifier rows and not others, a per-row or
    per-amplifier fallback may be evaluated. Save a method map and provenance
@@ -233,10 +288,12 @@ per-exposure outcome. Do not require a complete four-dither group to attempt
    labeled as corrected. The campaign ledger must still account for the
    exposure.
 
-The v2.7 candidate applies the combined scan and local surface to every
+The v2.10 candidate applies the combined scan and low-k surfaces to every
 exposure. Auto dither remains an explicit opt-in. Do not run it on a full
-database until the user has inspected these figures and requested that run.
-Keep correction method, fit success, and QC outcome separate.
+database until the user has inspected the v2.10 figures and requested that run.
+Keep correction method, fit success, and QC outcome separate. `cal/` must
+remain free of median, `Background2D`, and pedestal subtraction so it remains
+the sky measurement product.
 
 Suggested provenance fields:
 
@@ -280,7 +337,7 @@ background metrics. Calibrate any acceptance tolerance from these tests.
 - Keep a `REVIEW` state for valid models whose QC is borderline. `DITHQC=False`
   must never silently become an unqualified production pass.
 
-## Validation gates before deploying the local v2.7 candidate
+## Validation gates before deploying the local v2.10 candidate
 
 Run small, isolated tests first; leave existing NEP notebooks and live
 reductions unchanged.
@@ -306,7 +363,7 @@ reductions unchanged.
    Image3 manifests may include only products whose selected method and
    quality state meet the declared policy. Decide separately whether
    registered-dither `auto` mode is useful for a deployment; the current
-   candidate is the per-frame scan plus amplifier-local surface, and no
+   candidate is the per-frame scan plus masked low-k surfaces, and no
    production default has been changed.
 6. **Resource test:** benchmark workers by dither group with single-threaded
    BLAS/OpenMP. Measure peak RSS, read/write throughput, CPU utilization, and
@@ -345,7 +402,10 @@ mistaken for completed products.
 - v2.1 fallback mini-test: [`Stage2Plus v2.1 mini-test`](../../skysurfir/stage2plus-tests/20261103T-v21-auto-fallback/STAGE2PLUS_V21_MINITEST_REPORT.md)
 - v2.4 wisp-unmasked rerun: [`Stage2Plus wisp-unmasked mini-test`](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/WISP_UNMASKED_RERUN_REPORT.md)
 - The v2.6 scan-default change follows the user's review of the 20-exposure
-  figures. The local v2.7 amplifier-surface candidate is represented by the
-  three figures in `diagnostics/amp-scene-decomposition-20261105/`.
-  These mini-runs establish execution only, not scientific validation.
+  figures. The v2.7 and v2.8 per-frame candidates are represented by figures
+  in `diagnostics/amp-scene-decomposition-20261105/` and
+  `diagnostics/masked-lowk-y-poly-mini-20261106/`. These mini-runs establish
+  execution and residual diagnostics, not scientific validation.
+- The current v2.10 output semantics and paired final-product figures are in
+  `diagnostics/object-mask-v210-five-20261106/`; inspect these before deployment.
 - Parent JumProPe history: [`../handoff.md`](../handoff.md)

@@ -4,33 +4,43 @@ Exposure-level cleanup of JWST NIRCam Stage 2 `cal` files before drizzling.
 It works on any NIRCam imaging program: exposures are grouped from their FITS
 headers into dither groups (same program, observation, visit, visit group,
 sequence, activity, detector, filter and pupil). The default 1/f method is a
-per-frame `keep_trend=True` scan combined with an amplifier-local 2D low-k
-fit. Use `--onef-mode auto` to opt into dither fitting, with the per-frame
-method as backup if a dither model cannot be computed.
+per-frame unmasked `keep_trend=True` scan plus source-masked amplifier-local
+2D and detector-wide horizontal low-k fits. Use `--onef-mode auto` to opt
+into dither fitting, with the per-frame method as backup if a dither model
+cannot be computed.
 
 ## What it does
 
 For every exposure, in this order:
 
 1. **Input**: `SCI_ORIG` if the file has one, otherwise `SCI`.
-2. **Object mask**: photutils segmentation (2.8σ over the ERR array, 5
-   connected pixels). Short-wave frames add the long-wave mask of the same
-   exposure, reprojected through the WCS. Each object is grown by its
-   equivalent radius (at most 32 px) to cover galaxy outskirts. On wisp
-   detectors, the bright-wisp region is not masked from either 1/f fit.
+2. **Object mask**: Photutils first detects clear sources at 2.8σ with a
+   5-pixel minimum area. It masks those sources while estimating a coarse
+   512×512-pixel `Background2D`, then segments its residual at 2.0σ with a
+   3-pixel minimum area and unions those faint detections with the first
+   mask. This captures more diffuse galaxy outskirts; connected source masks
+   are still grown by the existing equivalent-radius rule (capped at 32 px).
+   Short-wave frames add the long-wave mask of the same exposure, reprojected
+   through the WCS. On wisp detectors, the bright-wisp region is not masked
+   from either 1/f fit.
 3. **1/f correction (default)**: use the single-frame Jumprope-style
    `profoundSkyScan(keep_trend=True)` scan. It excludes DQ/invalid pixels,
    includes source and wisp pixels in the scan profiles, and clips values
-   above the 90th percentile. On the scan residual, robust 128-pixel tile
-   medians fit one shared cubic surface across the detector and one quadratic
-   2D surface per amplifier. The correction is the amplifier surface minus
-   the shared surface, so smoothly continuous low-k structure stays in the
-   SCI while amplifier-local differences join the scan in one combined model.
-   The combined model is median-recentered and subtracted once. This is
-   recorded as `ONEFMETH=SELF` and `ONEFSTAT=REVIEW` because it has no
-   independent held-out validation. This candidate was exercised on three
-   production examples; see the included figures. Source-flux and diffuse-light
-   injection tests are still needed before broad production use.
+   above the 90th percentile. Then fit low-k components using robust
+   128-pixel tile medians outside the grown Photutils object mask plus four
+   extra dilation pixels. Keep a shared detector-wide cubic as the reference;
+   each amplifier's quadratic 2D fit minus that reference models
+   amplifier-local structure. A degree-2 polynomial in detector y, constant
+   across x, models broad horizontal structure without rotating to follow
+   sources. Evaluate both low-k maps across masked sources, add them to the
+   unmasked scan, and subtract the combined model once. `LOWKMASK`, `LOWKOBJ`,
+   and `LOWKDIL` record the mask and its dilation. The method is recorded as
+   `ONEFMETH=SELF` and `ONEFSTAT=REVIEW`; it has no independent held-out
+   validation. The latest five-frame mini-test figures are in
+   `diagnostics/object-mask-v210-five-20261106/`. They show the revised
+   faint-outskirt segmentation with the standard 1/f-then-wisp order;
+   source-flux and diffuse-light injection tests are still needed before
+   broad production use.
    `--onef-mode auto` opts into the registered-dither method: use every
    overlapping peer, reproject
    through full WCS, refine the relative x/y shift from mutual source matches
@@ -61,18 +71,23 @@ For every exposure, in this order:
 | Product | SCI |
 | --- | --- |
 | `cal_sky_renorm/` | input − 1/f − median sky − Background2D − wisp − pedestal |
-| `cal/` | input − 1/f − wisp − pedestal (sky retained) |
+| `cal/` | input − 1/f − wisp (original sky/background retained) |
 
-The two products differ only by the saved sky models. Never measure absolute
-sky brightness from `cal_sky_renorm/`.
+The `cal/` product is for measuring the true sky in object-free regions: it
+subtracts only the fitted 1/f model (including its masked low-k detector
+components) and the NMF wisp model. It does not subtract the median sky,
+`Background2D`, or the final pedestal. `cal_sky_renorm/` additionally removes
+those sky terms to provide a near-zero background for sky-subtracted mosaics.
+Never measure absolute sky brightness from `cal_sky_renorm/`.
 
 Both products keep the input's PRIMARY, ERR, DQ, AREA, VAR_* and ASDF
 extensions byte for byte; only SCI is replaced. Inputs are never modified.
 
 ### 1/f diagnostics and fallback
 
-The default `--onef-mode fallback` fits the single-frame scan and local
-amplifier 2D surfaces per exposure, then subtracts their combined model once.
+The default `--onef-mode fallback` fits a source-unmasked single-frame scan,
+then object-masked amplifier-local and detector-wide y-only surfaces per
+exposure. It subtracts the combined model once.
 `--onef-mode auto` opts into dither fitting and uses that per-frame method
 when there is no usable peer or the dither scene/row fit cannot be computed.
 Unexpected processing errors fail the group.
@@ -161,15 +176,21 @@ one CPU, including figures.
 | Path | Contents |
 | --- | --- |
 | `cal_sky_renorm/` | Sky-subtracted exposures for sky-subtracted mosaics. |
-| `cal/` | The same corrections with the sky retained. |
+| `cal/` | 1/f and wisp-corrected exposures with the original sky retained. |
 | `models/` | Per exposure: `OBJMASK`, `SKYMASK`, `ONEF` (1/f), `SKYBKG` (Background2D) and, on wisp detectors, `WISP`; `SKYMED` and `PEDESTAL` in the primary header. |
 | `figures/` | One PNG per exposure showing each step from input to both products. |
 | `summary.json` | Settings and, per exposure: masks, 1/f fit and QC, sky, Background2D, wisp and pedestal measurements; group errors. |
+
+In each exposure figure, the final `cal/` and `cal_sky_renorm/` panels share
+the same absolute MJy/sr stretch. The `cal/` panel is not median-centered for
+display, so its retained sky can make it look brighter than the sky-subtracted
+panel.
 
 SCI headers record `S2PVER`, `STGORDER`, `ONEFMETH` (`DITHER` or `SELF`),
 `ONEFSTAT`, `ONEFAPPL`, `ONEFVER`, `DITH1F` (whether a 1/f correction was
 applied), `DITHQC` (when optional held-out diagnostics were run), `DITHN` (the
 number of peers in the selected scene),
-`ONEFOBJ`, `SKYSUB`, `SKYMED`, `BKG2D`, `WISPMETH` and `PEDESTAL`.
+`ONEFOBJ`, `SEGNSIG`, `SEGNPIX`, `SEGBKG`, `SKYSUB`, `SKYMED`, `BKG2D`,
+`WISPMETH` and `PEDESTAL`.
 `summary.json` records the selected method, scan selection reason, dither
 attempts when `auto` is used, and any group errors.
