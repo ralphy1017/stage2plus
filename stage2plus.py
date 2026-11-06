@@ -44,7 +44,7 @@ from scipy import ndimage as ndi
 import steps
 from figures import plot_steps
 
-VERSION = "2.6"
+VERSION = "2.7"
 MIN_DITHERS = 1
 DITHER_MIN_DITHERS = 2
 DETECTOR_PATTERN = re.compile(r"^NRC[AB](?:[1-4]|LONG)$")
@@ -67,8 +67,8 @@ def group_label(info: dict) -> str:
 def _scan_onef(exp: steps.Exposure, fallback_bad: np.ndarray, *,
                dither_attempted: bool, dither_error: str | None,
                selection_reason: str) -> tuple[np.ndarray, dict]:
-    """Fit and record the source-unmasked single-frame scan correction."""
-    model, scan_meta = steps.scan_onef(exp.science, fallback_bad)
+    """Fit and record the scan plus per-amplifier 2D low-k correction."""
+    model, scan_meta = steps.scan_onef_joint(exp.science, fallback_bad)
     return model, {"method": "SELF", "status": "REVIEW", "applied": True,
                    "object_mask": False,
                    "fit_mask": "INVALID ONLY; SOURCES+WISP INCLUDED",
@@ -323,7 +323,7 @@ def main() -> int:
                         help="hold out up to two peers for optional RMS diagnostics; diagnostics never gate model use")
     parser.add_argument("--onef-mode", choices=("fallback", "auto"),
                         default="fallback",
-                        help="fallback (default): use the single-frame keep_trend scan; "
+                        help="fallback (default): use keep_trend scan plus per-amplifier 2D low-k fit; "
                              "auto: try registered dithers and scan only if fitting fails")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
@@ -407,8 +407,9 @@ def main() -> int:
                      key=lambda r: r["file"])
     summary = {"stage2plus": VERSION,
                "method": (
-                   ("object mask -> Jumprope-style single-frame scan 1/f "
-                    "(default); PHANGS-style multi-exposure dither is opt-in"
+                   ("object mask -> Jumprope-style single-frame scan plus "
+                    "amplifier-local 2D low-k fit (default); "
+                    "PHANGS-style multi-exposure dither is opt-in"
                     if args.onef_mode == "fallback" else
                     "object mask -> PHANGS-style multi-exposure dither 1/f "
                     "or Jumprope-style scan fallback")
@@ -417,7 +418,7 @@ def main() -> int:
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
                             "dither_min_dithers": DITHER_MIN_DITHERS,
                             "onef_mode": args.onef_mode.upper(),
-                            "fallback_method": "PROFOUND_SCAN_KEEP_TREND",
+                            "fallback_method": "PROFOUND_SCAN_KEEP_TREND_PLUS_AMP_LOCAL_2D",
                             "dither_diagnostics": cfg["dither_diagnostics"],
                             "onef_object_mask": cfg["onef_object_mask"],
                             "fallback_object_mask": False,

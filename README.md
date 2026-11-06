@@ -3,9 +3,10 @@
 Exposure-level cleanup of JWST NIRCam Stage 2 `cal` files before drizzling.
 It works on any NIRCam imaging program: exposures are grouped from their FITS
 headers into dither groups (same program, observation, visit, visit group,
-sequence, activity, detector, filter and pupil). The default 1/f method is the
-single-frame `keep_trend=True` scan. Use `--onef-mode auto` to opt into dither
-fitting, with the scan as backup if a dither model cannot be computed.
+sequence, activity, detector, filter and pupil). The default 1/f method is a
+per-frame `keep_trend=True` scan combined with an amplifier-local 2D low-k
+fit. Use `--onef-mode auto` to opt into dither fitting, with the per-frame
+method as backup if a dither model cannot be computed.
 
 ## What it does
 
@@ -20,8 +21,16 @@ For every exposure, in this order:
 3. **1/f correction (default)**: use the single-frame Jumprope-style
    `profoundSkyScan(keep_trend=True)` scan. It excludes DQ/invalid pixels,
    includes source and wisp pixels in the scan profiles, and clips values
-   above the 90th percentile. This is recorded as `ONEFMETH=SELF` and
-   `ONEFSTAT=REVIEW` because it has no independent held-out validation.
+   above the 90th percentile. On the scan residual, robust 128-pixel tile
+   medians fit one shared cubic surface across the detector and one quadratic
+   2D surface per amplifier. The correction is the amplifier surface minus
+   the shared surface, so smoothly continuous low-k structure stays in the
+   SCI while amplifier-local differences join the scan in one combined model.
+   The combined model is median-recentered and subtracted once. This is
+   recorded as `ONEFMETH=SELF` and `ONEFSTAT=REVIEW` because it has no
+   independent held-out validation. This candidate was exercised on three
+   production examples; see the included figures. Source-flux and diffuse-light
+   injection tests are still needed before broad production use.
    `--onef-mode auto` opts into the registered-dither method: use every
    overlapping peer, reproject
    through full WCS, refine the relative x/y shift from mutual source matches
@@ -62,10 +71,11 @@ extensions byte for byte; only SCI is replaced. Inputs are never modified.
 
 ### 1/f diagnostics and fallback
 
-The default `--onef-mode fallback` uses the single-frame scan for every
-exposure. `--onef-mode auto` opts into dither fitting and uses the scan only
+The default `--onef-mode fallback` fits the single-frame scan and local
+amplifier 2D surfaces per exposure, then subtracts their combined model once.
+`--onef-mode auto` opts into dither fitting and uses that per-frame method
 when there is no usable peer or the dither scene/row fit cannot be computed.
-Unexpected processing errors fail the group. No model is subtracted twice.
+Unexpected processing errors fail the group.
 
 Full-WCS reprojection carries valid-pixel coverage and keeps incomplete
 interpolation support out of the scene. Source matches estimate a relative

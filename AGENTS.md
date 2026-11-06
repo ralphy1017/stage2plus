@@ -3,24 +3,32 @@
 This file applies to the standalone `stage2plus` repository. Read
 [README.md](README.md) for supported CLI use, [CONTEXT.md](CONTEXT.md) for the
 scientific decision history, and [DEVELOPMENT.md](DEVELOPMENT.md) for the
-2026-11-03 SKYSURFIR pilot findings and remaining validation goals. The v2.6
-default is the single-frame `keep_trend=True` scan; the dither-first route is
-opt-in via `--onef-mode auto`. Its 20-exposure rerun is at
-`/data5/rzi/jp/stage2plus-fallback-default-mini-20261103/`. The user reviewed
-those figures and requested this default be published. See the run summary
-and this worktree's status before acting. The upstream repository is
-`ralphy1017/stage2plus` on `main`.
+2026-11-03 SKYSURFIR pilot findings and remaining validation goals. v2.7
+combines the single-frame
+`keep_trend=True` scan with an amplifier-local 2D low-k fit; dither-first is
+still opt-in via `--onef-mode auto`. The three-frame test figures are at
+`diagnostics/amp-scene-decomposition-20261105/`. The test used existing
+production outputs read-only and did not modify the active production run.
+The user reviewed the figures and requested publishing the candidate to
+`ralphy1017/stage2plus` `main`; this review does not constitute broad science
+validation or a production rerun.
+
+The earlier v2.6 20-exposure rerun is at
+`/data5/rzi/jp/stage2plus-fallback-default-mini-20261103/`; the user reviewed
+those figures and requested that scan default be published. Check the run
+summary and this worktree's status before acting.
 
 ## Identify the code and run before acting
 
 - Check `git status`, the current commit, and the input/output paths first.
-  The v2.6 default is the source-unmasked scan; `--onef-mode auto` opts into
-  the v2.5 dither-first workflow. `--no-onef-object-mask` controls source
-  masking for the dither fit only.
+  The local v2.7 default is the source-unmasked scan plus amplifier-local 2D
+  fit; `--onef-mode auto` opts into the v2.5 dither-first workflow. The
+  three-frame test is not a production rerun or broad science validation.
+  `--no-onef-object-mask` controls source masking for the dither fit only.
 - `stage2plus.py` owns CLI validation, FITS-header grouping, long-wave then
   short-wave scheduling, product assembly, metadata, and summary writing.
   `steps.py` owns masks, WCS projection, registered-dither and single-frame
-  scan 1/f fits, masked sky, `Background2D`, NMF wisp fitting, and FITS
+  scan/2D amplifier 1/f fits, masked sky, `Background2D`, NMF wisp fitting, and FITS
   copying. `figures.py` renders a step figure for each exposure. `templates/`
   contains 16 existing NMF basis FITS assets. `requirements.txt` lists the
   Python packages.
@@ -33,9 +41,10 @@ and this worktree's status before acting. The upstream repository is
 1. Keep the current order: Photutils source mask, selected dither-or-scan 1/f,
    object-masked median sky, `Background2D` residual sky, NMF wisp where a
    template exists, then masked scalar pedestal. The sky fits are performed
-   before the wisp fit. The extra four-amplifier/horizontal background fits
-   from earlier pilots are not in this workflow. PHANGS pjpipe destriping was
-   tried and dropped at the user's request.
+   before the wisp fit. The local v2.7 candidate adds only the per-frame
+   amplifier-local 2D low-k term described below; do not add a separate
+   background subtraction pass. PHANGS pjpipe destriping was tried and
+   dropped at the user's request.
 2. Write both products from the **same** 1/f, wisp, and pedestal models:
    `cal_sky_renorm/` subtracts both sky models; `cal/` retains them. Do not
    apply additional sky subtraction to `cal/`. Do not use sky-subtracted SCI
@@ -45,8 +54,13 @@ and this worktree's status before acting. The upstream repository is
    Keep PRIMARY, ERR, DQ, AREA, VAR_POISSON, VAR_RNOISE, VAR_FLAT, and ASDF
    data in both outputs, replacing only SCI and adding provenance
    cards/history. Preserve FITS checksums.
-4. The default `--onef-mode fallback` applies the Jumprope-style single-frame
-   scan (`keep_trend=True`) to every exposure. `--onef-mode auto` opts into
+4. The local v2.7 default `--onef-mode fallback` fits the Jumprope-style
+   single-frame scan (`keep_trend=True`) with per-amplifier 2D surfaces from
+   the same frame. A full-detector cubic surface is kept as shared low-k
+   structure; each amplifier's quadratic surface minus that shared surface
+   joins the scan in one combined model. Only detector-invalid pixels are
+   excluded, no object mask or dither peers are used, and the global median is
+   preserved. `--onef-mode auto` opts into
    dither fitting; it applies every computable dither model even when optional
    held-out QC fails, and uses the scan only when the dither scene/row model
    cannot be computed. `DITHQC` records optional diagnostics separately; it

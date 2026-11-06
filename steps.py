@@ -545,6 +545,166 @@ def scan_onef(image: np.ndarray, invalid: np.ndarray) -> tuple[np.ndarray, dict]
     return np.asarray(model_xy.T, dtype=np.float32), meta
 
 
+def _surface_design(x: np.ndarray, y: np.ndarray, degree: int) -> np.ndarray:
+    """Low-order 2D polynomial basis, ordered by total degree."""
+    return np.column_stack([x ** i * y ** (total - i)
+                            for total in range(degree + 1)
+                            for i in range(total + 1)])
+
+
+def _surface_evaluate(coef: np.ndarray, x: np.ndarray, y: np.ndarray,
+                      degree: int) -> np.ndarray:
+    """Evaluate a polynomial surface without allocating a full pixel design matrix."""
+    result = np.zeros((len(y), len(x)), dtype=np.float32)
+    index = 0
+    for total in range(degree + 1):
+        for i in range(total + 1):
+            j = total - i
+            result += (np.float32(coef[index]) *
+                       (y[:, None] ** j) * (x[None, :] ** i))
+            index += 1
+    return result
+
+
+def _robust_surface_fit(x: np.ndarray, y: np.ndarray, z: np.ndarray,
+                        degree: int = 3) -> tuple[np.ndarray, dict]:
+    """Fit a clipped polynomial to robust tile medians, not individual pixels."""
+    design = _surface_design(x, y, degree)
+    keep = np.isfinite(z) & np.all(np.isfinite(design), axis=1)
+    min_points = design.shape[1] + 5
+    if keep.sum() < min_points:
+        raise ValueError(f"Too few tiles for degree-{degree} 2D surface fit")
+    for _ in range(5):
+        coef = np.linalg.lstsq(design[keep], z[keep], rcond=None)[0]
+        residual = z - design @ coef
+        center = float(np.median(residual[keep]))
+        sigma = robust_sigma(residual[keep])
+        if not np.isfinite(sigma) or sigma <= 1e-12:
+            break
+        updated = np.isfinite(residual) & (np.abs(residual - center) <= 3.5 * sigma)
+        if updated.sum() < min_points or np.array_equal(updated, keep):
+            break
+        keep = updated
+    coef = np.linalg.lstsq(design[keep], z[keep], rcond=None)[0]
+    return coef, {"tiles": int(z.size), "used_tiles": int(keep.sum()),
+                  "degree": degree,
+                  "fit_rms": float(np.sqrt(np.mean((z[keep] - design[keep] @ coef) ** 2)))}
+
+
+def _tile_medians(image: np.ndarray, good: np.ndarray, tile: int
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return robust low-k samples and their detector coordinates."""
+    ny, nx = image.shape
+    xs, ys, values, amplifiers = [], [], [], []
+    width = nx // 4
+    for y0 in range(0, ny, tile):
+        y1 = min(ny, y0 + tile)
+        for x0 in range(0, nx, tile):
+            x1 = min(nx, x0 + tile)
+            amp = min(3, x0 // width)
+            valid = good[y0:y1, x0:x1] & np.isfinite(image[y0:y1, x0:x1])
+            if valid.mean() < 0.25:
+                continue
+            values.append(float(np.median(image[y0:y1, x0:x1][valid])))
+            xs.append((x0 + x1 - 1) / 2.0)
+            ys.append((y0 + y1 - 1) / 2.0)
+            amplifiers.append(amp)
+    return (np.asarray(xs), np.asarray(ys), np.asarray(values),
+            np.asarray(amplifiers, dtype=np.int8))
+
+
+def fit_amp_local_lowk(image: np.ndarray, invalid: np.ndarray, *,
+                       tile: int = 128, global_degree: int = 3,
+                       local_degree: int = 2) -> tuple[np.ndarray, dict]:
+    """Fit only 2D low-k structure localized to one of four amplifiers.
+
+    A single full-detector polynomial is the shared, continuous low-k scene.
+    Each amplifier also gets a local 2D surface. The subtracted term is the
+    local surface minus the shared surface, so structure that continues
+    smoothly across the detector is retained while amplifier-confined
+    curvature or offsets become a correction. Tile medians suppress compact
+    sources; only detector-invalid pixels are excluded.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    invalid = np.asarray(invalid, dtype=bool)
+    good = ~invalid & np.isfinite(image) & (image != 0)
+    ny, nx = image.shape
+    if nx % 4:
+        raise ValueError("Amplifier-local fit requires four equal-width regions")
+    if good.sum() < 10000:
+        raise ValueError("Too few valid pixels for amplifier-local low-k fit")
+    xs, ys, z, amps = _tile_medians(image, good, tile)
+    xg = 2.0 * xs / max(nx - 1, 1) - 1.0
+    yg = 2.0 * ys / max(ny - 1, 1) - 1.0
+    shared_coef, shared_stats = _robust_surface_fit(xg, yg, z, global_degree)
+    yy = 2.0 * np.arange(ny, dtype=np.float32) / max(ny - 1, 1) - 1.0
+    xx_global = 2.0 * np.arange(nx, dtype=np.float32) / max(nx - 1, 1) - 1.0
+    shared = _surface_evaluate(shared_coef, xx_global, yy, global_degree)
+    local = np.zeros_like(image, dtype=np.float32)
+    local_stats = {}
+    amp_width = nx // 4
+    for amp in range(4):
+        select = amps == amp
+        if select.sum() < (local_degree + 1) * (local_degree + 2) // 2 + 5:
+            raise ValueError(f"Too few low-k tiles in amplifier {amp + 1}")
+        xlocal = 2.0 * (xs[select] - amp * amp_width) / max(amp_width - 1, 1) - 1.0
+        local_coef, fit_stats = _robust_surface_fit(
+            xlocal, yg[select], z[select], local_degree)
+        x0, x1 = amp * amp_width, (amp + 1) * amp_width
+        xl = (2.0 * np.arange(amp_width, dtype=np.float32) /
+              max(amp_width - 1, 1) - 1.0)
+        local_surface = _surface_evaluate(local_coef, xl, yy, local_degree)
+        local[:, x0:x1] = local_surface - shared[:, x0:x1]
+        local_stats[f"A{amp + 1}"] = {**fit_stats,
+            "local_model_rms": float(np.sqrt(np.mean(
+                local[:, x0:x1][good[:, x0:x1]].astype(np.float64) ** 2)))}
+
+    # The low-k component is differential by construction; remove its global
+    # median so this step cannot change the exposure's absolute sky pedestal.
+    local[~good] = 0.0
+    local -= np.float32(np.median(local[good]))
+    median_before = float(np.median(image[good]))
+    median_after = float(np.median((image - local)[good]))
+    local += np.float32(median_after - median_before)
+    local[~good] = 0.0
+    return local, {"algorithm": "AMP_LOCAL_2D_MINUS_SHARED_SURFACE",
+                   "tile_px": tile, "global_degree": global_degree,
+                   "local_degree": local_degree,
+                   "shared_fit": shared_stats,
+                   "amplifiers": local_stats,
+                   "shared_surface_rms": float(np.sqrt(np.mean(
+                       shared[good].astype(np.float64) ** 2))),
+                   "local_model_rms": float(np.sqrt(np.mean(
+                       local[good].astype(np.float64) ** 2))),
+                   "fit_fraction": float(good.mean()),
+                   "global_median_before": median_before,
+                   "global_median_after": float(np.median((image - local)[good]))}
+
+
+def scan_onef_joint(image: np.ndarray, invalid: np.ndarray
+                    ) -> tuple[np.ndarray, dict]:
+    """Jointly model keep-trend 1/f and amplifier-confined 2D low-k residuals.
+
+    The components are estimated on the same frame and returned as one model
+    for one subtraction. The shared full-detector low-k surface is a protected
+    reference; only the four amplifier-local residual surfaces are subtracted.
+    """
+    data = np.asarray(image, dtype=np.float32)
+    scan_model, scan_stats = scan_onef(data, invalid)
+    amp_model, amp_stats = fit_amp_local_lowk(data - scan_model, invalid)
+    model = scan_model + amp_model
+    bad = np.asarray(invalid, dtype=bool) | ~np.isfinite(data) | (data == 0)
+    model[bad] = 0.0
+    return model, {"algorithm": "PROFOUND_SCAN_KEEP_TREND_PLUS_AMP_LOCAL_2D",
+                   "keep_trend": True,
+                   "scan_model_rms": scan_stats["model_rms"],
+                   "scan": scan_stats, "amp_lowk": amp_stats,
+                   "model_rms": float(np.sqrt(np.mean(
+                       model[~bad].astype(np.float64) ** 2))),
+                   "fit_fraction": min(scan_stats["fit_fraction"],
+                                       amp_stats["fit_fraction"])}
+
+
 # Sky, wisp and pedestal -----------------------------------------------------
 
 def masked_median(image: np.ndarray, good: np.ndarray) -> float:

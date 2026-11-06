@@ -108,8 +108,23 @@ diffuse sky mode or separation of astronomical sky from instrumental offsets.
    applied 20 scan models, and completed with zero group errors. The user
    reviewed its figures and requested this default be published. This run
    validates execution and file assembly, not science quality.
+8. **v2.7 per-frame amplifier-surface correction.**
+   The user observed residual backgrounds in the four vertical amplifier
+   regions and asked to preserve smooth low-k structure shared across regions
+   while correcting 2D low-k structure local to individual regions. The
+   candidate fits the `keep_trend=True` scan and additive low-k components
+   from one exposure, then subtracts their combined model once. A robust
+   full-frame cubic surface is retained; each amplifier's quadratic surface
+   minus that shared surface is added to the scan model. The global median is
+   recentered exactly. Three existing production examples were tested
+   read-only; figures are in
+   `diagnostics/amp-scene-decomposition-20261105/`, and the user reviewed
+   them and requested publishing this candidate. The 48.1%, 25.8%, and
+   1.8% values reported for those frames are fractional changes in the
+   256-pixel-smoothed image relative to the current products, not validation
+   scores. No production FITS files were modified.
 
-## Current v2.6 mode and recorded products
+## Current v2.7 candidate mode and recorded products
 
 `steps.read_exposure` reads `SCI_ORIG` when present, otherwise `SCI`, and
 identifies unusable pixels from DO_NOT_USE DQ (grown one pixel), nonfinite or
@@ -126,11 +141,12 @@ when another group exposure is available and uses every overlapping peer.
    long-wave mask is projected by WCS onto short-wave exposures when present.
    Each connected object is grown by its equivalent radius, capped at 32
    pixels. Bad pixels and grown sources are excluded from the optional auto
-   dither fit. The scan default excludes only detector-invalid pixels by mask;
-   source and bright-wisp pixels participate in its profiles, subject to the
-   90th-percentile clip. No bright-wisp region mask is applied in either 1/f
-   mode. The sky mask still excludes invalid pixels, grown objects, and the NMF wisp
-   support grown by eight pixels during later sky estimation.
+   dither fit. The scan and amplifier-local fit exclude only detector-invalid
+   pixels by mask; source and bright-wisp pixels participate, subject to the
+   scan's 90th-percentile clip and robust tile medians. No bright-wisp region
+   mask is applied in either 1/f mode. The sky mask still excludes invalid
+   pixels, grown objects, and the NMF wisp support grown by eight pixels
+   during later sky estimation.
 2. **Optional PHANGS-inspired dither 1/f.** In `--onef-mode auto`, full-WCS
    reprojection maps each
    peer onto the target detector grid with fractional valid-coverage handling.
@@ -150,18 +166,23 @@ when another group exposure is available and uses every overlapping peer.
    have measurable row offsets; peers without overlap are skipped. The single-
    scan backup is used only when no peer remains or the dither scene/row model
    cannot be computed. Both outputs use the same one selected 1/f model.
-3. **Default single-frame scan.** The scan default ports Jumprope's
+3. **Default single-frame joint model.** The scan component ports Jumprope's
    `profoundSkyScan(..., keep_trend=True)` behavior: transpose the image into
    detector scan orientation, exclude detector-invalid pixels, and do not
    apply source or bright-wisp region masks. It still clips values above the
    90th percentile, so the highest source pixels can be excluded by value. It
    measures 40th-percentile row/column profiles, scans in 512-row blocks, and
    keeps the centered profiles after subtracting a 501-pixel running-median
-   trend. This matches the `one_over_f(...,
-   keep_trend=True)` behavior in the parent `stage2-plus.py`; it is implemented
-   locally in `steps.py` with no additional dependency. It produces one `ONEF`
-   map and is subtracted once. `ONEFOBJ=False` records that no source mask was
-   used. It has no independent held-out QC and is marked `ONEFSTAT=REVIEW`.
+   trend. On the scan residual, tile medians at 128-pixel spacing fit a robust
+   cubic surface across all four amplifiers and a quadratic 2D surface within
+   each amplifier. The local correction is the amplifier surface minus the
+   shared surface, so shared smooth structure remains in SCI. The shared
+   surface is a fit reference only; it is never subtracted. The local term is
+   combined with the scan into one `ONEF` map, then median-recentered so the
+   global SCI median is unchanged. It is implemented locally in `steps.py`
+   and uses no object mask or dither peer. `ONEFOBJ=False` records that no
+   source mask was used. The fit has no independent held-out QC and is marked
+   `ONEFSTAT=REVIEW`.
 4. **Sky and wisps.** The masked median is subtracted first. A
    `Background2D` residual model uses 256-pixel boxes, a 3×3 filter,
    `BiweightLocationBackground`, `SigmaClip()`, and 50% box exclusion by
@@ -199,6 +220,7 @@ method and product provenance.
 | `/data5/rzi/jp/stage2plus-phangs-v25-mini-20261103/` | Local v2.5 default all-peer PHANGS-style dither fit; 20 exposures, four groups, four leased CPUs | 20/20 each of `cal/`, `cal_sky_renorm/`, `models/`, and step figures; 20/20 dither models applied, zero fallbacks, zero group errors. Output FITS checksums passed; 280 non-SCI output HDUs matched input arrays; `cal/` model arithmetic closed exactly; masked final sky medians were within 7.3e-12 MJy/sr of zero. Execution validation only. |
 | `/data5/rzi/jp/stage2plus-phangs-v25-diag-mini-20261103/` | Separate optional `--dither-diagnostics --no-figures` run on the same 20 exposures | 14 dither models computed (5 passed, 9 failed the custom held-out 5% RMS check); 6 scan fallbacks occurred because withholding peers left an unusable reduced scene. These results do not gate the default all-peer fit. |
 | `/data5/rzi/jp/stage2plus-fallback-default-mini-20261103/` | v2.6 default scan mode, same 20 exposures, four leased CPUs | 20/20 each of `cal/`, `cal_sky_renorm/`, `models/`, and step figures; 20/20 `SELF` scan models applied; zero dither attempts and group errors. Output FITS checksums passed; 280 non-SCI HDUs matched input arrays; `cal/` model arithmetic closed exactly and masked sky medians were within 4.6e-13 MJy/sr of zero. User reviewed the figures and requested publishing the default change; execution checks do not establish science quality. |
+| `diagnostics/amp-scene-decomposition-20261105/` | Local v2.7 per-frame candidate on the three named examples from `/data4/rzi/skysurfir/stage2plus/skysurfir-combined-v1/production-20261105-v1/` | Median sky preserved to printed precision on all three; inter-amplifier residual medians moved toward the shared surface. Fractional 256-pixel-smoothed image change versus current products: 48.1%, 25.8%, and 1.8%. Figures are for manual review; this is not a production run or source-flux validation. |
 
 These paths are records on the development machine, **not** data shipped in
 the Git repository. The v1 input manifest is
@@ -232,10 +254,12 @@ with zero dither attempts, zero group errors, and 20 `SELF` models applied.
   long-wave mask. The current v2 code does not require a basis for every
   wisp-sensitive input; absent bases lead to `WISPMETH=NONE`. Review coverage
   before a full database run.
-- The current default scan avoids the residual dither result observed in the
-  v2.5 figures. The user reviewed the v2.6 figures and requested publishing
-  the scan default. The mini-run does not establish science quality across
-  exposures beyond this set.
+- The v2.7 local amplifier-surface candidate was run only on the three
+  specified frames. Its global cubic reference may not capture every
+  non-polynomial galaxy or intracluster-light profile, and the per-region
+  component can therefore still overlap astrophysical flux. Review the three
+  figures and run source/diffuse-light injections before using it on a full
+  database. The existing production products were not changed.
 - In optional auto mode, a dither scene needs enough common sky after full-WCS peer reprojection.
   Sparse overlap or heavily masked amplifier rows can still make the fit
   impossible and invoke the scan backup. Source-match residuals are recorded

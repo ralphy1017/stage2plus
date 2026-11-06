@@ -3,28 +3,31 @@
 **Audience:** future agents developing the standalone Stage2Plus reducer and
 its SKYSURFIR integration.
 
-**Status:** v2.6 defaults to the single-frame Jumprope-style
-`keep_trend=True` scan; the PHANGS-inspired all-peer dither remains opt-in via
-`--onef-mode auto`. The 20-exposure v2.6 rerun applied the scan to all 20
-exposures with zero errors. The user reviewed its step figures and requested
-publishing this default. The run verifies execution and FITS assembly, not
-sky/source-flux fidelity or production readiness.
+**Status:** v2.7 combines the single-frame Jumprope-style `keep_trend=True`
+scan with an amplifier-local 2D low-k fit; registered dither remains opt-in
+via `--onef-mode auto`. The user requested per-frame decomposition: preserve
+smooth low-k structure shared across amplifier regions, subtract low-k
+structure localized within a region, and estimate both terms as one combined
+1/f model. The three-frame test figures are at
+`diagnostics/amp-scene-decomposition-20261105/`; the user reviewed the figures
+and requested publishing this version. Active production outputs were not
+changed, and this three-frame review is not broad science validation.
 
 ## User goal
 
-The user's current instruction makes the single-frame `keep_trend=True` scan
-the default for supported science imaging. The registered-dither method is
-available only as an opt-in `--onef-mode auto`. Keep the sky-retaining `cal/`
-and sky-subtracted `cal_sky_renorm/` branches consistent with the selected
-correction model.
+The user's current instruction keeps the method per frame and fits the
+`keep_trend=True` scan together with the shared and amplifier-local 2D
+components. The registered-dither method remains available as opt-in
+`--onef-mode auto`. Keep the sky-retaining `cal/` and sky-subtracted
+`cal_sky_renorm/` branches consistent with the selected correction model.
 
 The long-term scope is all selected science imaging, including groups with
 fewer than four dithers. Instrument-specific adapters and validation are
 required: current Stage2Plus supports NIRCam imaging, and its NIRCam masks,
 templates, and thresholds must not be applied blindly to NIRISS or MIRI. The
-the current default is the single-frame scan following the user's review of
-the v2.6 figures. Unsupported or failed exposures must receive an explicit
-hold or failure status, never silently pass through as corrected.
+current local candidate is the joint single-frame fit following the user's
+review of v2.6 residuals. Unsupported or failed exposures must receive an
+explicit hold or failure status, never silently pass through as corrected.
 
 This brief does not authorize a production database run. It describes the
 future behavior the user wants and the evidence needed before enabling it.
@@ -159,6 +162,24 @@ the input arrays, `cal/` arithmetic closed exactly against the saved models,
 and masked final sky medians were within 4.6e-13 MJy/sr of zero. The user
 reviewed the figures and requested publication of the scan default.
 
+The local v2.7 candidate adds a 2D amplifier surface to that scan. It bins
+the single exposure into 128-pixel median tiles, fits a robust cubic surface
+over the detector and a quadratic surface separately in each amplifier, and
+adds each local-minus-shared surface to the scan model. The shared surface is
+kept in SCI; the local terms and scan are subtracted together once. A median
+recenter keeps the input sky pedestal unchanged. The scan and surface fits
+use detector-invalid masks only, without dither peers or object masks.
+
+The test used the current production products for
+`jw01176341001_02101_00003_nrca2`, `jw01176361001_02103_00001_nrca2`, and
+`jw01176241001_02105_00002_nrcb1`. It reconstructed each input from `cal/`
+SCI plus saved `ONEF`, optional `WISP`, and pedestal models, then wrote only
+three PNGs under `diagnostics/amp-scene-decomposition-20261105/`. The global
+median was preserved on all three; the 256-pixel-smoothed image changed by
+48.1%, 25.8%, and 1.8% relative to current products. These changes and the
+surface model itself need visual review; source-flux and diffuse-light
+injection tests have not been run.
+
 The plan found matching NMF WISP bases in 31 of 78 groups; 47 groups (212
 exposures) had no basis. This is a separate correction-coverage gap from 1/f.
 
@@ -169,9 +190,10 @@ pilot did not run Image3 or perform a complete source-flux injection study.
 
 ## Current default mode and optional dither mode
 
-The current default is the single-frame scan. The dither workflow described
-below is opt-in through `--onef-mode auto`; the user selected the scan after
-reviewing residual striping in the dither-default figures.
+The current local candidate is the single-frame scan plus the amplifier-local
+2D term. The dither workflow described below is opt-in through
+`--onef-mode auto`; the user selected per-frame modeling after reviewing
+residuals in the dither-default figures.
 
 For every exposure in the frozen science manifest, record exactly one
 per-exposure outcome. Do not require a complete four-dither group to attempt
@@ -190,16 +212,16 @@ per-exposure outcome. Do not require a complete four-dither group to attempt
    model based on the historical 0.1-pixel or 5% criteria. The optional
    `--dither-diagnostics` mode withholds peers and changes the scene being fit;
    use it to measure transfer to held-out peers, not as the default.
-3. **Default per-exposure scan.** The v2.5 implementation uses an
-   invalid-pixel-masked, source- and wisp-unmasked scan correction based on the
-   NEP/JumproPe `scan_1f(..., keep_trend=True)` behavior referenced by
-   [`../stage2-plus.py`](../stage2-plus.py). The implementation is pinned in
-   `steps.py`; it does not rely on an external JumproPe runtime. It is selected
-   by default. In `auto` mode it is selected when no usable peer exists or
-   dither fitting raises. A failed optional held-out diagnostic does not
-   discard a computed dither model. Exactly one selected model is subtracted in both output
-   branches. Validate source flux and diffuse-sky recovery before treating
-   this fallback as production-ready.
+3. **Default per-exposure joint fit.** The scan follows the invalid-pixel-only,
+   source-unmasked NEP/JumproPe `scan_1f(..., keep_trend=True)` behavior
+   referenced by [`../stage2-plus.py`](../stage2-plus.py). A shared cubic
+   surface across all four amplifiers is retained; each amplifier's quadratic
+   2D fit minus that shared surface is combined with the scan into one model.
+   The global median is preserved and the combined model is subtracted once.
+   In `auto` mode this fit is selected when no usable peer exists or dither
+   fitting raises. A failed optional held-out diagnostic does not discard a
+   computed dither model. Validate source flux and diffuse-sky recovery before
+   treating the local candidate as production-ready.
 4. **Use a hybrid model only when its parts are explicit.** If the dither fit
    is supported in some amplifier rows and not others, a per-row or
    per-amplifier fallback may be evaluated. Save a method map and provenance
@@ -211,10 +233,10 @@ per-exposure outcome. Do not require a complete four-dither group to attempt
    labeled as corrected. The campaign ledger must still account for the
    exposure.
 
-The current default applies the scan to every exposure. Auto dither remains an
-explicit opt-in. Do not switch the default back until the user has inspected
-the figures and requests that change. Keep correction method, fit success, and
-QC outcome separate.
+The v2.7 candidate applies the combined scan and local surface to every
+exposure. Auto dither remains an explicit opt-in. Do not run it on a full
+database until the user has inspected these figures and requested that run.
+Keep correction method, fit success, and QC outcome separate.
 
 Suggested provenance fields:
 
@@ -258,7 +280,7 @@ background metrics. Calibrate any acceptance tolerance from these tests.
 - Keep a `REVIEW` state for valid models whose QC is borderline. `DITHQC=False`
   must never silently become an unqualified production pass.
 
-## Validation gates before making `auto` the database default
+## Validation gates before deploying the local v2.7 candidate
 
 Run small, isolated tests first; leave existing NEP notebooks and live
 reductions unchanged.
@@ -282,15 +304,18 @@ reductions unchanged.
 5. **Publication audit:** require one terminal ledger state per selected
    exposure, atomic per-exposure products, and no untracked partial files.
    Image3 manifests may include only products whose selected method and
-   quality state meet the declared policy.
+   quality state meet the declared policy. Decide separately whether
+   registered-dither `auto` mode is useful for a deployment; the current
+   candidate is the per-frame scan plus amplifier-local surface, and no
+   production default has been changed.
 6. **Resource test:** benchmark workers by dither group with single-threaded
    BLAS/OpenMP. Measure peak RSS, read/write throughput, CPU utilization, and
    time by method. Preserve the shared CPU lease and bounded I/O policy.
 
-Do not claim the default is ready until the pilot has no unexplained missing
-exposures, every fallback has flux/sky validation, all method and QC states
-are represented in the ledger, and partial outputs cannot be mistaken for
-completed products.
+Do not claim the local candidate is ready until the pilot has no unexplained
+missing exposures, source flux and diffuse sky are validated, all method and
+QC states are represented in the ledger, and partial outputs cannot be
+mistaken for completed products.
 
 ## Implementation order
 
@@ -309,9 +334,8 @@ completed products.
    hold state before connecting it to automatic Image3 selection.
 4. Make each exposure write transactional. Reconcile group completion and
    prevent partial files from entering downstream manifests.
-5. Run the validation gates above, update `README.md`, `CONTEXT.md`, and this
-   brief with actual evidence, then enable `auto` in the science database
-   notebooks by default.
+5. Run the validation gates above and update `README.md`, `CONTEXT.md`, and
+   this brief with actual evidence before any broad deployment.
 
 ## Related records
 
@@ -321,5 +345,7 @@ completed products.
 - v2.1 fallback mini-test: [`Stage2Plus v2.1 mini-test`](../../skysurfir/stage2plus-tests/20261103T-v21-auto-fallback/STAGE2PLUS_V21_MINITEST_REPORT.md)
 - v2.4 wisp-unmasked rerun: [`Stage2Plus wisp-unmasked mini-test`](../../skysurfir/stage2plus-tests/20261103T-wcs-reprojection-mini/WISP_UNMASKED_RERUN_REPORT.md)
 - The v2.6 scan-default change follows the user's review of the 20-exposure
-  figures. The mini-runs establish execution only, not scientific validation.
+  figures. The local v2.7 amplifier-surface candidate is represented by the
+  three figures in `diagnostics/amp-scene-decomposition-20261105/`.
+  These mini-runs establish execution only, not scientific validation.
 - Parent JumProPe history: [`../handoff.md`](../handoff.md)
