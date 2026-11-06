@@ -144,7 +144,7 @@ diffuse astronomical component.
    in all five. These are execution and background diagnostics, not source
    flux or diffuse-light validation.
 
-## Current v2.10 candidate mode and recorded products
+## Current published v2.10 mode and recorded products
 
 `steps.read_exposure` reads `SCI_ORIG` when present, otherwise `SCI`, and
 identifies unusable pixels from DO_NOT_USE DQ (grown one pixel), nonfinite or

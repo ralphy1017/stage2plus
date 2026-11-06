@@ -4,7 +4,7 @@ This file applies to the standalone `stage2plus` repository. Read
 [README.md](README.md) for supported CLI use, [CONTEXT.md](CONTEXT.md) for the
 scientific decision history, and [DEVELOPMENT.md](DEVELOPMENT.md) for the
 2026-11-06 SKYSURFIR pilot findings and remaining validation goals. The local
-v2.10 candidate keeps object masks out of the keep-trend scan, uses an initial
+Published v2.10 keeps object masks out of the keep-trend scan, uses an initial
 Photutils mask plus a 512-pixel coarse background and 2.0σ/3-pixel residual
 segmentation to capture faint outskirts, then fits amplifier-local surfaces
 and a detector-wide y-only polynomial in one 1/f model. The five-frame test
@@ -21,7 +21,7 @@ summary and this worktree's status before acting.
 ## Identify the code and run before acting
 
 - Check `git status`, the current commit, and the input/output paths first.
-  The local v2.10 default is the source-unmasked scan plus object-masked
+  The v2.10 default is the source-unmasked scan plus object-masked
   amplifier and detector-wide low-k fits; `--onef-mode auto` opts into the
   dither-first workflow. The five-frame test is not a production rerun or
   broad science validation.
@@ -58,7 +58,7 @@ summary and this worktree's status before acting.
    Keep PRIMARY, ERR, DQ, AREA, VAR_POISSON, VAR_RNOISE, VAR_FLAT, and ASDF
    data in both outputs, replacing only SCI and adding provenance
    cards/history. Preserve FITS checksums.
-4. The local v2.10 default `--onef-mode fallback` fits the Jumprope-style
+4. The v2.10 default `--onef-mode fallback` fits the Jumprope-style
    single-frame scan (`keep_trend=True`) using detector-invalid pixels only.
    It then fits robust 128-pixel tile medians outside the grown source mask
    plus four additional dilation pixels. A full-frame cubic surface is kept

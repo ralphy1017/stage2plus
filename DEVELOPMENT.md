@@ -3,7 +3,7 @@
 **Audience:** future agents developing the standalone Stage2Plus reducer and
 its SKYSURFIR integration.
 
-**Status:** Local v2.10 keeps the Jumprope-style `keep_trend=True` scan
+**Status:** Published v2.10 (`main`, commit `d1defc7`) keeps the Jumprope-style `keep_trend=True` scan
 unmasked, then fits amplifier-local 2D surfaces and a detector-wide y-only
 polynomial outside a dilated Photutils object mask. `cal/` subtracts only this
 1/f model and the wisp model, preserving the measured sky and its spatial
@@ -31,7 +31,7 @@ The long-term scope is all selected science imaging, including groups with
 fewer than four dithers. Instrument-specific adapters and validation are
 required: current Stage2Plus supports NIRCam imaging, and its NIRCam masks,
 templates, and thresholds must not be applied blindly to NIRISS or MIRI. The
-current local candidate is the v2.10 masked-low-k single-frame fit following
+current published method is the v2.10 masked-low-k single-frame fit following
 the user's review of v2.7 residuals. Unsupported or failed exposures must receive an
 explicit hold or failure status, never silently pass through as corrected.
 
@@ -215,7 +215,7 @@ pilot did not run Image3 or perform a complete source-flux injection study.
 
 ## Current default mode and optional dither mode
 
-The current local candidate is the single-frame unmasked scan plus
+The current v2.10 method is the single-frame unmasked scan plus
 object-masked amplifier-local and detector-wide y-only low-k fits. The dither
 workflow described below is opt-in through
 `--onef-mode auto`; the user selected per-frame modeling after reviewing
@@ -288,7 +288,7 @@ production outputs remain untouched.
    labeled as corrected. The campaign ledger must still account for the
    exposure.
 
-The v2.10 candidate applies the combined scan and low-k surfaces to every
+The v2.10 method applies the combined scan and low-k surfaces to every
 exposure. Auto dither remains an explicit opt-in. Do not run it on a full
 database until the user has inspected the v2.10 figures and requested that run.
 Keep correction method, fit success, and QC outcome separate. `cal/` must
@@ -337,7 +337,7 @@ background metrics. Calibrate any acceptance tolerance from these tests.
 - Keep a `REVIEW` state for valid models whose QC is borderline. `DITHQC=False`
   must never silently become an unqualified production pass.
 
-## Validation gates before deploying the local v2.10 candidate
+## Validation gates before broad science deployment of v2.10
 
 Run small, isolated tests first; leave existing NEP notebooks and live
 reductions unchanged.
