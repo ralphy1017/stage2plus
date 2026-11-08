@@ -3,19 +3,18 @@
 **Audience:** future agents developing the standalone Stage2Plus reducer and
 its SKYSURFIR integration.
 
-**Status:** Published v2.10 (`main`, commit `d1defc7`) keeps the Jumprope-style `keep_trend=True` scan
-unmasked, then fits amplifier-local 2D surfaces and a detector-wide y-only
-polynomial outside a dilated Photutils object mask. `cal/` subtracts only this
-1/f model and the wisp model, preserving the measured sky and its spatial
-structure. `cal_sky_renorm/` additionally subtracts the masked median,
-`Background2D`, and pedestal. Its final panels use one shared absolute stretch
-for `cal/` and `cal_sky_renorm/`; the remaining sky is allowed to look
-different. The revised five-frame mini-test is in
-`diagnostics/object-mask-v210-five-20261106/`. The object mask now starts with
-a 2.8σ/5-pixel seed, estimates a 512-pixel coarse background, then adds
-2.0σ/3-pixel detections from that residual. The wisp remains after the full
-1/f fit. Production outputs were not changed; this candidate is not broadly
-science-validated.
+**Status:** v2.11 sets the default per-frame order to keep-trend scan,
+primary NMF fit/subtraction, object-masked 2D low-k fit, then a residual NMF
+fit on the sky-bearing `cal`. `cal/` still excludes median, `Background2D`,
+and pedestal subtraction. Those sky steps follow NMF in `cal_sky_renorm/`.
+Object segmentation remains a 2.8σ/5-pixel seed plus 2.0σ/3-pixel residual
+detections after a seed-masked 512-pixel coarse background. A two-frame
+template-injection test is in `diagnostics/wisp-order-mini-20261107/`; the
+code-path mini-run is in `/tmp/stage2plus-v211-wisp-order-mini-20261107/`.
+The tested low-k-before-NMF order allowed the 1/f model to absorb 47–58% of a
+known injected WISP pattern; the revised order reduced that to 3–6%. This is
+not broad source-flux or diffuse-light validation, and production outputs
+were not changed.
 
 ## User goal
 
@@ -31,12 +30,13 @@ The long-term scope is all selected science imaging, including groups with
 fewer than four dithers. Instrument-specific adapters and validation are
 required: current Stage2Plus supports NIRCam imaging, and its NIRCam masks,
 templates, and thresholds must not be applied blindly to NIRISS or MIRI. The
-current published method is the v2.10 masked-low-k single-frame fit following
-the user's review of v2.7 residuals. Unsupported or failed exposures must receive an
+current published method is the v2.11 NMF-before-low-k single-frame fit,
+following the user's review of v2.7 residuals and the two-frame template
+injection comparison. Unsupported or failed exposures must receive an
 explicit hold or failure status, never silently pass through as corrected.
 
-This brief does not authorize a production database run. It describes the
-future behavior the user wants and the evidence needed before enabling it.
+This brief does not authorize a production database run. It records the
+requested behavior and the evidence still needed before broad use.
 
 ## Current implementation and pilot evidence
 
@@ -215,8 +215,9 @@ pilot did not run Image3 or perform a complete source-flux injection study.
 
 ## Current default mode and optional dither mode
 
-The current v2.10 method is the single-frame unmasked scan plus
-object-masked amplifier-local and detector-wide y-only low-k fits. The dither
+The current v2.11 method is the single-frame unmasked scan, primary NMF,
+object-masked amplifier-local and detector-wide y-only low-k fits, and a
+residual NMF pass. The dither
 workflow described below is opt-in through
 `--onef-mode auto`; the user selected per-frame modeling after reviewing
 residuals in the dither-default figures.
@@ -253,30 +254,26 @@ per-exposure outcome. Do not require a complete four-dither group to attempt
    computed dither model. Validate source flux and diffuse-sky recovery before
    treating the local candidate as production-ready.
 
-## Sky-preserving output semantics (v2.10 local)
+## Sky-preserving output semantics (v2.11)
 
-`cal/` is the product for absolute sky measurements. It subtracts the selected
-1/f map (the scan plus masked low-k amplifier and detector-y components) and
-the fitted wisp template, with no median-sky, `Background2D`, or pedestal
-subtraction. `cal_sky_renorm/` subtracts the object-masked median,
-`Background2D` residual, and final pedestal as well. The two final figure
-panels are displayed with the same absolute MJy/sr stretch; the sky-bearing
-`cal/` image is not recentered for display.
+`cal/` is the product for absolute sky measurements. It subtracts the
+keep-trend scan, primary NMF model, masked low-k components fitted on the
+WISP-corrected residual, and a small residual NMF model. It receives no
+median-sky, `Background2D`, or pedestal subtraction. `cal_sky_renorm/`
+subtracts the object-masked median, `Background2D` residual, and final
+pedestal as well. Final-pair figures use a shared absolute MJy/sr stretch.
 
-The five requested exposures were rerun from their original `/data3` inputs
-to `/tmp/stage2plus-objectmask-v210-five-20261106/`. All 5/5 completed in four
-groups with zero errors using the revised mask: a 2.8σ/5-pixel seed, a
-seed-masked 512-pixel coarse background, then 2.0σ/3-pixel detections on the
-background residual. The accepted order remains 1/f, median sky,
-`Background2D`, wisp, then pedestal in the sky-subtracted branch; `cal/`
-subtracts only 1/f and wisp. The `cal/` masked median matched the measured
-post-1/f sky median in all five, and `cal_sky_renorm/` masked medians were
-zero. Both branches closed exactly against saved models on valid pixels.
-Figures, summary, and audit are in
-`diagnostics/object-mask-v210-five-20261106/`; final pairs use identical
-absolute stretches within each exposure. The experiment moving wisp ahead of
-the low-k fit was not adopted. No source-flux injection test has been run;
-production outputs remain untouched.
+The two NRCB4 F200W exposures in the NMF-order test each received a known
+0.5-amplitude combination of the first three NMF templates. In the old order,
+1/f absorbed 47% and 58%; with scan → NMF → low-k → residual NMF it absorbed
+3% and 6%, and the final `cal` retained 1.5% and less than 0.1% of the
+injected template projection. Moving NMF ahead of `Background2D` while
+leaving it after full 1/f did not fix the 1/f share. The comparison figure
+and per-fit summary are in `diagnostics/wisp-order-mini-20261107/`; temporary
+intermediate arrays are in `/tmp/stage2plus-wisp-transfer-20261107/`.
+Production outputs were untouched. Test other detectors, filters, and fields
+before treating this as broadly validated; no source-flux injection test has
+been run.
 4. **Use a hybrid model only when its parts are explicit.** If the dither fit
    is supported in some amplifier rows and not others, a per-row or
    per-amplifier fallback may be evaluated. Save a method map and provenance
@@ -288,9 +285,10 @@ production outputs remain untouched.
    labeled as corrected. The campaign ledger must still account for the
    exposure.
 
-The v2.10 method applies the combined scan and low-k surfaces to every
-exposure. Auto dither remains an explicit opt-in. Do not run it on a full
-database until the user has inspected the v2.10 figures and requested that run.
+The v2.11 method applies scan, NMF, and low-k corrections to every exposure
+with a matching basis; auto dither remains an explicit opt-in. Do not run it
+on a full database until the user requests that run after inspecting the
+relevant figures.
 Keep correction method, fit success, and QC outcome separate. `cal/` must
 remain free of median, `Background2D`, and pedestal subtraction so it remains
 the sky measurement product.
@@ -337,7 +335,7 @@ background metrics. Calibrate any acceptance tolerance from these tests.
 - Keep a `REVIEW` state for valid models whose QC is borderline. `DITHQC=False`
   must never silently become an unqualified production pass.
 
-## Validation gates before broad science deployment of v2.10
+## Validation gates before broad science deployment of v2.11
 
 Run small, isolated tests first; leave existing NEP notebooks and live
 reductions unchanged.
@@ -362,9 +360,9 @@ reductions unchanged.
    exposure, atomic per-exposure products, and no untracked partial files.
    Image3 manifests may include only products whose selected method and
    quality state meet the declared policy. Decide separately whether
-   registered-dither `auto` mode is useful for a deployment; the current
-   candidate is the per-frame scan plus masked low-k surfaces, and no
-   production default has been changed.
+   registered-dither `auto` mode is useful for a deployment. The published
+   default is per-frame scan, primary NMF, masked low-k surfaces, and residual
+   NMF; broad science validation remains outstanding.
 6. **Resource test:** benchmark workers by dither group with single-threaded
    BLAS/OpenMP. Measure peak RSS, read/write throughput, CPU utilization, and
    time by method. Preserve the shared CPU lease and bounded I/O policy.
@@ -406,6 +404,6 @@ mistaken for completed products.
   in `diagnostics/amp-scene-decomposition-20261105/` and
   `diagnostics/masked-lowk-y-poly-mini-20261106/`. These mini-runs establish
   execution and residual diagnostics, not scientific validation.
-- The current v2.10 output semantics and paired final-product figures are in
-  `diagnostics/object-mask-v210-five-20261106/`; inspect these before deployment.
+- The v2.11 NMF-order prototype and paired final-product figures are in
+  `diagnostics/wisp-order-mini-20261107/`; broader validation is still needed.
 - Parent JumProPe history: [`../handoff.md`](../handoff.md)

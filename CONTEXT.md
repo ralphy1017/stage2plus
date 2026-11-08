@@ -1,6 +1,6 @@
 # stage2plus: project context and validation record
 
-Updated 2026-11-06. This document explains why the current reducer has its
+Updated 2026-11-07. This document explains why the current reducer has its
 particular order and what has actually been tested. Use [README.md](README.md)
 for installation and CLI examples; use [AGENTS.md](AGENTS.md) for operational
 rules when changing or running the code.
@@ -19,13 +19,14 @@ The v2 pipeline has two outputs for each input:
 
 | Output | SCI content | Intended use |
 | --- | --- | --- |
-| `cal/` | input − selected 1/f − NMF wisp | Exposure for absolute sky measurements; no median-sky, `Background2D`, or pedestal subtraction. |
-| `cal_sky_renorm/` | input − selected 1/f − object-masked median sky − `Background2D` residual − NMF wisp − final scalar pedestal | Sky-subtracted drizzle input with near-zero masked background. |
+| `cal/` | input − scan − primary NMF − masked low-k − residual NMF | Exposure for absolute sky measurements; no median-sky, `Background2D`, or pedestal subtraction. |
+| `cal_sky_renorm/` | `cal/` − object-masked median sky − `Background2D` residual − final scalar pedestal | Sky-subtracted drizzle input with near-zero masked background. |
 
-`cal/` receives only the 1/f and wisp models; it does not receive the median,
-`Background2D`, or pedestal subtraction, so object-free regions remain usable
-for measuring the true sky. The wisp fit is measured on the temporarily
-sky-subtracted image, but only its fitted template is subtracted from `cal/`.
+`cal/` receives only the 1/f and primary/residual wisp models; it does not
+receive median, `Background2D`, or pedestal subtraction, so object-free
+regions remain usable for measuring the true sky. The default per-frame path
+fits primary NMF after the keep-trend scan and before low-k fitting, then fits
+a small NMF residual after low-k correction. Sky fits follow both NMF passes.
 “Renormalization” in `cal_sky_renorm/` means additive median and pedestal
 corrections, not multiplication or photometric rescaling. Do not infer
 absolute sky surface brightness from `cal_sky_renorm/SCI`. Tests do not prove
@@ -144,7 +145,7 @@ diffuse astronomical component.
    in all five. These are execution and background diagnostics, not source
    flux or diffuse-light validation.
 
-## Current published v2.10 mode and recorded products
+## Current v2.11 mode and recorded products
 
 `steps.read_exposure` reads `SCI_ORIG` when present, otherwise `SCI`, and
 identifies unusable pixels from DO_NOT_USE DQ (grown one pixel), nonfinite or
@@ -191,14 +192,16 @@ when another group exposure is available and uses every overlapping peer.
    have measurable row offsets; peers without overlap are skipped. The single-
    scan backup is used only when no peer remains or the dither scene/row model
    cannot be computed. Both outputs use the same one selected 1/f model.
-3. **Default single-frame joint model.** The scan component ports Jumprope's
+3. **Default single-frame scan, NMF, and low-k model.** The scan component ports Jumprope's
    `profoundSkyScan(..., keep_trend=True)` behavior: transpose the image into
    detector scan orientation, exclude detector-invalid pixels, and do not
    apply source or bright-wisp region masks. It still clips values above the
    90th percentile, so the highest source pixels can be excluded by value. It
    measures 40th-percentile row/column profiles, scans in 512-row blocks, and
    keeps the centered profiles after subtracting a 501-pixel running-median
-   trend. On the scan residual, robust 128-pixel tile medians outside the
+   trend. Fit and subtract the primary error-weighted NMF model on this
+   scan-corrected frame before estimating the 2D low-k terms. On the
+   WISP-subtracted scan residual, robust 128-pixel tile medians outside the
    dilated object mask fit a cubic surface across all four amplifiers and a
    quadratic 2D surface within each amplifier. The shared surface is only a
    reference; subtract the per-amplifier local-minus-shared difference, not
@@ -207,21 +210,18 @@ when another group exposure is available and uses every overlapping peer.
    constant across x and models broad horizontal structure without rotating.
    Both low-k components are recentered on the unmasked background and added
    to the scan in one `ONEF` map. They are evaluated under source pixels but
-   fitted only outside the object mask. `ONEFOBJ=False`, `LOWKOBJ=True`, and
-   `LOWKDIL=4` distinguish scan masking from low-k fit masking. The method is
-   local to `steps.py`, has no dither peers, and has no independent held-out
-   QC; it is marked `ONEFSTAT=REVIEW`.
-4. **Sky and wisps.** This sequence applies to `cal_sky_renorm/` only. The
-   `cal/` branch stops after subtracting the selected 1/f and fitted wisp
-   models so absolute sky measurements remain available. In the sky-subtracted
-   branch, the masked median is subtracted first. A
-   `Background2D` residual model uses 256-pixel boxes, a 3×3 filter,
-   `BiweightLocationBackground`, `SigmaClip()`, and 50% box exclusion by
-   default. On detector/filter combinations with a bundled basis, the fixed
-   NMF components are fitted by ERR-weighted nonnegative least squares after
-   measuring an off-wisp baseline. The last masked median is the pedestal.
+   fitted only outside the object mask. A residual NMF fit on the sky-bearing
+   result cleans up any template-shaped structure left by the low-k fit.
+   `ONEFOBJ=False`, `LOWKOBJ=True`, and `LOWKDIL=4` distinguish scan masking
+   from low-k fit masking. The method has no dither peers or independent
+   held-out QC and is marked `ONEFSTAT=REVIEW`.
+4. **Sky subtraction.** After both NMF fits, measure the object-masked median
+   on the corrected `cal`, then fit the residual sky with `Background2D`
+   (256-pixel boxes, a 3×3 filter, `BiweightLocationBackground`,
+   `SigmaClip()`, and 50% box exclusion by default). Subtract a final masked
+   pedestal from the sky-subtracted branch.
 5. **Outputs.** `models/<basename>.fits` contains `OBJMASK`, `LOWKMASK`,
-   `SKYMASK`, `ONEF`, `SKYBKG`, and `WISP` when fitted; its primary header stores
+   `SKYMASK`, `ONEF`, `SKYBKG`, `WISP1`, `WISPRES`, and total `WISP` when fitted; its primary header stores
    `SKYMED` and `PEDESTAL`. `figures/<stem>_steps.png` shows input, masks,
    models, intermediate frames, and both final products. `summary.json`
    records per-exposure values and any group errors. Both output FITS copy
@@ -255,6 +255,7 @@ method and product provenance.
 | `diagnostics/masked-lowk-y-poly-mini-20261106/` | Local v2.8 on the five exposures named in the 2026-11-06 user request; single-frame fallback; one worker | 5/5 completed in four groups, zero errors. Comparing old and new `cal/` with the same v2.8 fit mask, the centered four-amplifier median range improved in four frames (0.00425→0.00358, 0.00375→0.00387, 0.00051→0.00004, 0.08351→0.05379, 0.00149→0.00058 MJy/sr). The robust scatter of 64-row background medians decreased in all five (0.00173→0.00139, 0.00453→0.00339, 0.00027→0.00025, 0.25326→0.14003, 0.00248→0.00224 MJy/sr). These are residual-background diagnostics, not source-flux or diffuse-light validation. FITS outputs are in `/tmp/stage2plus-lowk-masked-mini-20261106/`; production outputs were untouched. |
 | `diagnostics/flat-background-mini-20261106/` | Local v2.9 on the same five examples; single-frame fallback; one worker | 5/5 completed in four groups, zero errors. `cal/` subtracts only 1/f and wisp; its masked median exactly matches the post-1/f sky median. `cal_sky_renorm/` additionally subtracts median, `Background2D`, and pedestal; its masked median is zero. Both branches closed exactly against saved model arrays on valid pixels. Final pairs use the same absolute display stretch. Outputs are in `/tmp/stage2plus-flat-background-mini-20261106/`; production outputs were untouched. |
 | `diagnostics/object-mask-v210-five-20261106/` | Local v2.10 on the same five examples; revised faint-outskirt segmentation; original 1/f-then-wisp order; one worker | 5/5 completed in four groups, zero errors. The 2.8σ/5-pixel seed is extended with 2.0σ/3-pixel residual detections after a seed-masked 512-pixel coarse background. `cal/` subtracts only 1/f+wisp and retains its measured masked sky median; `cal_sky_renorm/` additionally subtracts masked median, `Background2D`, wisp, and pedestal, yielding masked median zero. Both branches close exactly against saved model arrays on valid pixels. The paired final-product sheet uses the same absolute stretch within each exposure pair. Outputs are in `/tmp/stage2plus-objectmask-v210-five-20261106/`; production outputs were untouched. This execution and visual check is not a diffuse-source injection or broad science validation. The wisp-before-1/f experiment was rejected. |
+| `diagnostics/wisp-order-mini-20261107/` | v2.11 order prototype on two NRCB4 F200W exposures; known 0.5-amplitude injection into each of the first three NMF bases | In the current order, the full 1/f fit absorbed 47% and 58% of the injected WISP pattern. Moving only the NMF fit ahead of `Background2D` did not change those 1/f shares. The tested order—keep-trend scan → primary NMF subtraction → refit masked low-k → residual NMF—reduced the 1/f share to 3% and 6%; NMF accounted for 95% and 94%, leaving 1.5% and <0.1% in the final `cal`. A small residual fit was needed for one frame. This isolates low-k/NMF competition on two examples; it is not broad validation. The v2.11 CLI mini-run then processed both original exposures with zero group errors and wrote FITS products and per-frame figures under `/tmp/stage2plus-v211-wisp-order-mini-20261107/`; `cal` closure against saved ONEF+WISP was within 6.5e-6 MJy/sr. Production data were untouched. |
 
 These paths are records on the development machine, **not** data shipped in
 the Git repository. The v1 input manifest is

@@ -3,15 +3,16 @@
 
 For each exposure in a dither group (same visit, detector, filter and pupil)
 it writes two products from the input science. By default it fits an
-unmasked single-frame keep-trend scan plus object-masked amplifier-local and
-detector-wide y-only low-k components. The optional auto mode first tries a
+unmasked single-frame keep-trend scan, subtracts a primary NMF wisp model,
+fits object-masked amplifier-local and detector-wide y-only low-k components,
+then fits a residual NMF model. The optional auto mode first tries a
 registered-dither model using all overlapping peers, then uses the per-frame
 fit only when that fit cannot be computed:
 
-  cal_sky_renorm/  photutils object mask -> registered-dither 1/f -> masked
-                   median sky -> Background2D residual sky -> NMF wisp (where
-                   a template exists) -> masked pedestal renormalisation
-  cal/             input - 1/f - NMF wisp; original sky/background retained
+  cal_sky_renorm/  object mask -> scan -> primary NMF -> masked low-k ->
+                   residual NMF -> masked median sky -> Background2D ->
+                   masked pedestal
+  cal/             input - scan - low-k - both NMF models; sky retained
 
 Models and masks go to models/, one step-by-step figure per exposure to
 figures/, and per-exposure measurements to summary.json. Long-wave groups run
@@ -42,9 +43,9 @@ from astropy.io import fits
 from scipy import ndimage as ndi
 
 import steps
-from figures import plot_steps
+from figures import BIN, plot_steps
 
-VERSION = "2.10"
+VERSION = "2.11"
 MIN_DITHERS = 1
 DITHER_MIN_DITHERS = 2
 DETECTOR_PATTERN = re.compile(r"^NRC[AB](?:[1-4]|LONG)$")
@@ -64,29 +65,34 @@ def group_label(info: dict) -> str:
                      info["filter"], info["pupil"])).lower()
 
 
+def _display_bin(image: np.ndarray) -> np.ndarray:
+    """Downsample a model for figures without retaining another full frame."""
+    factor = BIN
+    ny, nx = image.shape
+    cropped = image[:ny // factor * factor, :nx // factor * factor]
+    return cropped.reshape(ny // factor, factor, nx // factor, factor).mean(axis=(1, 3))
+
+
 def _scan_onef(exp: steps.Exposure, fallback_bad: np.ndarray,
                lowk_object_mask: np.ndarray, *,
                capture_components: bool,
                dither_attempted: bool, dither_error: str | None,
                selection_reason: str) -> tuple[np.ndarray, dict]:
-    """Fit an unmasked scan plus source-masked low-k components."""
-    result = steps.scan_onef_joint(exp.science, fallback_bad, lowk_object_mask,
-                                   return_components=capture_components)
-    if capture_components:
-        model, scan_meta, components = result
-    else:
-        model, scan_meta = result
-        components = None
+    """Fit the source-unmasked scan; low-k fits follow the primary NMF pass."""
+    model, scan_meta = steps.scan_onef(exp.science, fallback_bad)
+    components = ({"scan": _display_bin(model)} if capture_components else None)
     return model, {"method": "SELF", "status": "REVIEW", "applied": True,
                    "object_mask": False,
-                   "fit_mask": "SCAN: INVALID ONLY; LOW-K: INVALID+GROWN OBJECTS+DILATED 4PX",
+                   "fit_mask": ("SCAN: INVALID ONLY; LOW-K: INVALID+GROWN OBJECTS+"
+                                "DILATED 4PX; PRIMARY NMF SUBTRACTED BEFORE LOW-K"),
                    "lowk_object_mask": True,
                    "qc_accepted": None,
                    "dither_attempted": dither_attempted,
                    "dither_error": dither_error,
                    "fallback_attempted": True,
                    "fallback_reason": selection_reason,
-                   "fallback": scan_meta,
+                   "fallback": {**scan_meta,
+                                "algorithm": "SCAN_KEEP_TREND_THEN_NMF_THEN_MASKED_AMP_2D_AND_GLOBAL_Y_POLY"},
                    "_components": components,
                    "model_rms": scan_meta["model_rms"],
                    "fit_fraction": scan_meta["fit_fraction"]}
@@ -175,31 +181,102 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
             [objects[j] for j in peer_indices], cfg["dither_diagnostics"],
             cfg["onef_mode"])
         onef_components = onef_meta.pop("_components", None)
-        after_onef = exp.science - onef
-        sky_mask = exp.invalid | grown[i] | ~np.isfinite(after_onef)
+
+        wisp_primary = wisp_residual = wisp = None
+        wisp_primary_meta = wisp_residual_meta = wisp_meta = None
+        lowk_amp = lowk_y = None
+        if onef_meta["method"] == "SELF":
+            # Fit the broad WISP basis after the source-unmasked trend scan,
+            # before the 2D low-k surfaces can absorb that morphology.
+            scan = onef
+            after_scan = exp.science - scan
+            if basis is not None:
+                wisp_primary, wisp_primary_meta = steps.fit_wisp(
+                    after_scan, exp.err, exp.invalid | grown[i], *basis, template)
+            after_primary = (after_scan - wisp_primary if wisp_primary is not None
+                             else after_scan)
+
+            # The low-k fit sees the WISP-subtracted scene, with the existing
+            # grown-object mask and four-pixel extra dilation.
+            lowk_amp, amp_meta = steps.fit_amp_local_lowk(
+                after_primary, exp.invalid, lowk_masks[i])
+            after_amp = after_primary - lowk_amp
+            lowk_y, y_meta = steps.fit_global_y_polynomial(
+                after_amp, exp.invalid, lowk_masks[i])
+            onef = scan + lowk_amp + lowk_y
+            after_onef = exp.science - onef
+            after_lowk = (after_onef - wisp_primary if wisp_primary is not None
+                          else after_onef)
+
+            valid_onef = (~exp.invalid & np.isfinite(exp.science)
+                          & (exp.science != 0))
+            onef_meta["fallback"].update({
+                "amp_lowk": amp_meta, "global_y_lowk": y_meta,
+                "model_rms": float(np.sqrt(np.mean(
+                    onef[valid_onef].astype(np.float64) ** 2))),
+                "lowk_fit_order": "AFTER_PRIMARY_NMF"})
+            onef_meta["model_rms"] = onef_meta["fallback"]["model_rms"]
+            onef_meta["fit_fraction"] = min(
+                onef_meta["fallback"]["fit_fraction"],
+                amp_meta["fit_fraction"], y_meta["fit_fraction"])
+            if onef_components is not None:
+                onef_components["amp_local"] = _display_bin(lowk_amp)
+                onef_components["global_y"] = _display_bin(lowk_y)
+
+            # A second fit only captures template-shaped residuals left by
+            # the fitted low-k surfaces; it is usually small or zero.
+            if basis is not None:
+                wisp_residual, wisp_residual_meta = steps.fit_wisp(
+                    after_lowk, exp.err, exp.invalid | grown[i], *basis, template)
+            final_cal = (after_lowk - wisp_residual
+                         if wisp_residual is not None else after_lowk)
+        else:
+            # Dither mode has no local 2D low-k surfaces. Keep its single
+            # NMF correction after the selected dither model.
+            after_onef = exp.science - onef
+            after_scan = after_onef
+            after_primary = after_onef
+            after_lowk = after_onef
+            if basis is not None:
+                wisp_primary, wisp_primary_meta = steps.fit_wisp(
+                    after_onef, exp.err, exp.invalid | grown[i], *basis, template)
+            final_cal = (after_onef - wisp_primary
+                         if wisp_primary is not None else after_onef)
+
+        if wisp_primary is not None:
+            wisp = wisp_primary.copy()
+            if wisp_residual is not None:
+                wisp += wisp_residual
+            primary_amplitudes = np.asarray(wisp_primary_meta["amplitudes"], float)
+            residual_amplitudes = (np.asarray(wisp_residual_meta["amplitudes"], float)
+                                   if wisp_residual_meta is not None
+                                   else np.zeros_like(primary_amplitudes))
+            wisp_meta = {**wisp_primary_meta,
+                         "amplitudes": (primary_amplitudes + residual_amplitudes).tolist(),
+                         "primary_amplitudes": primary_amplitudes.tolist(),
+                         "residual_amplitudes": residual_amplitudes.tolist(),
+                         "primary_stage": ("AFTER_SCAN_BEFORE_LOWK"
+                                           if onef_meta["method"] == "SELF"
+                                           else "AFTER_DITHER_1F"),
+                         "residual_fit_pixels": (wisp_residual_meta["fit_pixels"]
+                                                  if wisp_residual_meta else 0)}
+
+        sky_mask = exp.invalid | grown[i] | ~np.isfinite(final_cal)
         if support is not None:
             sky_mask |= support
         sky_good = ~sky_mask
 
-        # 3. Masked median sky, then 4. JADES Background2D residual sky.
-        sky_median = steps.masked_median(after_onef, sky_good)
-        skyless = after_onef - np.float32(sky_median)
+        # 3. Measure sky after both WISP fits, then fit residual Background2D.
+        sky_median = steps.masked_median(final_cal, sky_good)
+        skyless = final_cal - np.float32(sky_median)
         background, bkg_meta = steps.background2d(skyless, sky_mask,
                                                   cfg["bkg_exclude_percentile"])
         no_background = skyless - background
 
-        # 5. NMF wisp, fitted on the sky-subtracted frame.
-        wisp, wisp_meta = None, None
-        if basis is not None:
-            wisp, wisp_meta = steps.fit_wisp(no_background, exp.err, exp.invalid | grown[i],
-                                             *basis, template)
-        after_wisp = no_background - wisp if wisp is not None else no_background
-
         # 6. Pedestal is applied only to the sky-subtracted branch. Keep cal
         # free of median/background/pedestal adjustments for sky measurement.
-        pedestal = steps.masked_median(after_wisp, sky_good)
-        final_sky = after_wisp - np.float32(pedestal)
-        final_cal = after_onef - wisp if wisp is not None else after_onef
+        pedestal = steps.masked_median(no_background, sky_good)
+        final_sky = no_background - np.float32(pedestal)
 
         name = exp.path.name
         cards = {"S2PVER": (VERSION, "stage2plus version"),
@@ -224,6 +301,9 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                             "coarse segmentation background box pixels"),
                  "SKYMED": (sky_median, "masked median sky (MJy/sr)"),
                  "WISPMETH": ("NMF" if wisp is not None else "NONE", "wisp model"),
+                 "WISPPASS": (2 if wisp_residual is not None else
+                              1 if wisp_primary is not None else 0,
+                              "primary plus residual NMF fits"),
                  "PEDESTAL": (pedestal, "skyless branch only (MJy/sr)")}
         if onef_meta["qc_accepted"] is not None:
             cards["DITHQC"] = (onef_meta["qc_accepted"],
@@ -231,18 +311,31 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
         if onef_meta["method"] == "DITHER":
             cards["DITHN"] = (len(onef_meta["scene_dithers"]),
                               "dithers in selected 1/f scene")
+        if onef_meta["method"] == "SELF":
+            cal_order = "MASK-SCAN-NMF-LK-NMF"
+            sky_order = "MASK-SCAN-NMF-LK-NMF-MED-BKG-PED"
+            cal_history = "SCI = input - scan - primary NMF - low-k - residual NMF"
+            sky_history = ("SCI = input - scan - primary NMF - low-k - residual NMF"
+                           " - median sky - Background2D - pedestal")
+        else:
+            cal_order = "MASK-DITHER-NMF"
+            sky_order = "MASK-DITHER-NMF-MED-BKG-PED"
+            cal_history = "SCI = input - dither 1/f - NMF wisp"
+            sky_history = ("SCI = input - dither 1/f - NMF wisp - median sky"
+                           " - Background2D - pedestal")
         steps.write_fits(exp, out / "cal_sky_renorm" / name, final_sky,
-                         cards={**cards, "STGORDER": ("MASK-1F-SKY-BKG2D-WISP-PED", "steps"),
+                         cards={**cards, "STGORDER": (sky_order, "steps"),
                                 "SKYSUB": (True, "median sky and Background2D removed"),
                                 "BKG2D": (True, "Background2D residual sky removed")},
-                         history="SCI = input - 1/f - median sky - Background2D - wisp - pedestal")
+                         history=sky_history)
         steps.write_fits(exp, out / "cal" / name, final_cal,
-                         cards={**cards, "STGORDER": ("MASK-1F-WISP", "steps"),
+                         cards={**cards, "STGORDER": (cal_order, "steps"),
                                 "SKYSUB": (False, "sky retained")},
-                         history="SCI = input - 1/f - wisp; sky, Background2D, and pedestal retained")
+                         history=cal_history + "; sky, median, Background2D, pedestal retained")
         write_models(exp, out / "models" / name, objects[i], lowk_masks[i],
                      sky_mask, onef,
-                     background, wisp, sky_median, pedestal, onef_meta)
+                     background, wisp, sky_median, pedestal, onef_meta,
+                     wisp_primary, wisp_residual)
 
         noise = steps.robust_sigma(final_sky[sky_good][::40])
         if cfg["figures"]:
@@ -256,18 +349,23 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
                          sky_mask.astype(np.uint8) + lowk_masks[i], "mask"),
                         ("Keep-trend scan model",
                          None if onef_components is None else onef_components["scan"], "model_binned"),
+                        ("Primary NMF wisp model", wisp_primary, "model"),
+                        (("After scan + primary NMF" if onef_meta["method"] == "SELF"
+                          else "After dither 1/f + NMF"), after_primary, "sky"),
                         ("Masked amplifier-local low-k model",
                          None if onef_components is None else onef_components["amp_local"], "model_binned"),
                         ("Masked detector-wide y polynomial",
                          None if onef_components is None else onef_components["global_y"], "model_binned"),
                         (f"{onef_meta['method']} 1/f model", onef, "model"),
-                        ("After 1/f", after_onef, "sky"),
+                        (("After low-k + primary NMF" if onef_meta["method"] == "SELF"
+                          else "After selected 1/f + NMF"), after_lowk, "sky"),
+                        ("Residual NMF wisp model", wisp_residual, "model"),
+                        ("Final cal (sky retained; correction only)", final_cal, "absolute"),
                         (f"After median sky ({sky_median:.4f})", skyless, "skyless"),
                         ("Background2D model", background, "model"),
                         ("After Background2D", no_background, "skyless"),
-                        ("NMF wisp model", wisp, "model"),
                         (f"Final cal_sky_renorm (pedestal {pedestal:+.2e})", final_sky, "absolute"),
-                        ("Final cal (sky retained; 1/f+wisp only)", final_cal, "absolute")],
+                        ("Total NMF wisp model", wisp, "model")],
                        exp.invalid, sky_median, noise)
 
         records.append({"input": str(exp.path), "file": name, "group": label,
@@ -286,7 +384,9 @@ def process_group(label: str, paths: list[str], cfg: dict) -> dict:
 
 
 def write_models(exp, path: Path, objects, lowk_mask, sky_mask, onef, background, wisp,
-                 sky_median: float, pedestal: float, onef_meta: dict) -> None:
+                 sky_median: float, pedestal: float, onef_meta: dict,
+                 wisp_primary: np.ndarray | None = None,
+                 wisp_residual: np.ndarray | None = None) -> None:
     primary = fits.PrimaryHDU()
     primary.header["SKYMED"] = (sky_median, "masked median sky (MJy/sr)")
     primary.header["PEDESTAL"] = (pedestal, "post-wisp masked median (MJy/sr)")
@@ -308,6 +408,9 @@ def write_models(exp, path: Path, objects, lowk_mask, sky_mask, onef, background
                                   "minimum faint-segment connected pixels")
     primary.header["SEGBKG"] = (steps.SEGMENT_BACKGROUND_BOX[0],
                                  "coarse segmentation background box pixels")
+    primary.header["WISPPASS"] = (2 if wisp_residual is not None else
+                                    1 if wisp_primary is not None else 0,
+                                    "primary plus residual NMF fits")
     primary.header["DITH1F"] = (onef_meta["applied"], "1/f correction applied")
     if onef_meta["qc_accepted"] is not None:
         primary.header["DITHQC"] = (onef_meta["qc_accepted"], "dither QC passed")
@@ -317,6 +420,12 @@ def write_models(exp, path: Path, objects, lowk_mask, sky_mask, onef, background
             fits.ImageHDU(sky_mask.astype(np.uint8), exp.sci_header, name="SKYMASK"),
             fits.ImageHDU(onef.astype(np.float32), exp.sci_header, name="ONEF"),
             fits.ImageHDU(background.astype(np.float32), exp.sci_header, name="SKYBKG")]
+    if wisp_primary is not None:
+        hdus.append(fits.ImageHDU(wisp_primary.astype(np.float32), exp.sci_header,
+                                  name="WISP1"))
+    if wisp_residual is not None:
+        hdus.append(fits.ImageHDU(wisp_residual.astype(np.float32), exp.sci_header,
+                                  name="WISPRES"))
     if wisp is not None:
         hdus.append(fits.ImageHDU(wisp.astype(np.float32), exp.sci_header, name="WISP"))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -375,7 +484,7 @@ def main() -> int:
                         help="hold out up to two peers for optional RMS diagnostics; diagnostics never gate model use")
     parser.add_argument("--onef-mode", choices=("fallback", "auto"),
                         default="fallback",
-                        help="fallback (default): unmasked keep_trend scan plus masked amplifier and detector-y low-k fits; "
+                        help="fallback (default): unmasked keep_trend scan, primary NMF, masked amplifier and detector-y low-k fits, then residual NMF; "
                              "auto: try registered dithers and use the per-frame fit only if fitting fails")
     parser.add_argument("--no-figures", action="store_true")
     parser.add_argument("--plan-only", action="store_true")
@@ -459,18 +568,19 @@ def main() -> int:
                      key=lambda r: r["file"])
     summary = {"stage2plus": VERSION,
                "method": (
-                   ("unmasked Jumprope-style scan plus object-masked "
-                    "amplifier-local 2D and detector-wide y-polynomial fits (default); "
-                    "PHANGS-style multi-exposure dither is opt-in"
+                   ("unmasked Jumprope-style keep-trend scan -> primary NMF wisp -> "
+                    "object-masked amplifier-local 2D and detector-wide y-polynomial "
+                    "low-k -> residual NMF fit (default); PHANGS-style multi-exposure "
+                    "dither is opt-in"
                     if args.onef_mode == "fallback" else
                     "object mask -> PHANGS-style multi-exposure dither 1/f "
                     "or Jumprope-style scan fallback")
-                   + " -> NMF wisp; cal/ applies only 1/f+wisp, while "
+                   + "; cal/ retains sky and subtracts 1/f plus NMF; "
                      "cal_sky_renorm/ also subtracts masked median, Background2D, and pedestal"),
                "settings": {"min_dithers": MIN_DITHERS, "workers": args.workers,
                             "dither_min_dithers": DITHER_MIN_DITHERS,
                             "onef_mode": args.onef_mode.upper(),
-                            "fallback_method": "SCAN_KEEP_TREND_PLUS_MASKED_AMP_2D_AND_GLOBAL_Y_POLY",
+                            "fallback_method": "SCAN_KEEP_TREND_THEN_NMF_THEN_MASKED_AMP_2D_AND_GLOBAL_Y_POLY",
                             "dither_diagnostics": cfg["dither_diagnostics"],
                             "onef_object_mask": cfg["onef_object_mask"],
                             "fallback_object_mask": False,
@@ -481,7 +591,10 @@ def main() -> int:
                             "dither_fit_mask": ("INVALID+SOURCE; WISP INCLUDED"
                                                 if cfg["onef_object_mask"]
                                                 else "INVALID ONLY; SOURCES+WISP INCLUDED"),
-                            "fallback_fit_mask": "SCAN INVALID ONLY; LOW-K INVALID+GROWN SOURCE MASK+DILATED 4PX",
+                            "fallback_fit_mask": ("SCAN INVALID ONLY; PRIMARY NMF THEN LOW-K "
+                                                  "INVALID+GROWN SOURCE MASK+DILATED 4PX"),
+                            "fallback_wisp_order": ("SCAN->NMF_PRIMARY->MASKED_AMP2D+GLOBAL_Y->"
+                                                    "NMF_RESIDUAL"),
                             "dither_wisp_mask": False,
                             "fallback_wisp_mask": False,
                             "dither_reprojection": "full WCS plus matched-source translation",
